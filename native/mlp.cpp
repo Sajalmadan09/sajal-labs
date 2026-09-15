@@ -6,56 +6,22 @@
 // exactly the kind of work an existing math library already solves, and
 // Accelerate is the only public path to the AMX matrix coprocessor on this
 // Apple Silicon machine. ReLU and softmax are trivial enough to hand-write.
-#include <Accelerate/Accelerate.h>
-
-#include <algorithm>
-#include <cmath>
+//
+// The MLP struct itself lives in mlp_model.hpp (shared with the sajal CLI);
+// this file is just the run/bench/once driver used by exp1/exp9/10's
+// benchmark scripts, kept deliberately unchanged by the CLI work so those
+// experiments' numbers stay reproducible.
 #include <cstdio>
 #include <fstream>
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "common.hpp"
-
-struct MLP {
-    int in_dim, hidden_dim, out_dim;
-    std::vector<float> W1, b1, W2, b2;  // W1:[hidden,in]  W2:[out,hidden]
-
-    // X:[n,in] row-major -> returns Y:[n,out] row-major, softmax applied per row.
-    // Built from the shared op library in common.hpp — see its comments for
-    // why W's [out,in] layout needs no physical transpose, and why softmax
-    // subtracts the row max first.
-    std::vector<float> forward(const std::vector<float>& X, int n) const {
-        std::vector<float> H(static_cast<size_t>(n) * hidden_dim);
-        linear(X.data(), n, in_dim, W1.data(), b1.data(), hidden_dim, H.data());
-        relu_inplace(H.data(), H.size());
-
-        std::vector<float> Y(static_cast<size_t>(n) * out_dim);
-        linear(H.data(), n, hidden_dim, W2.data(), b2.data(), out_dim, Y.data());
-        softmax_rows(Y.data(), n, out_dim);
-        return Y;
-    }
-};
-
-MLP load_model(const std::string& artifacts_dir) {
-    std::ifstream shapes(artifacts_dir + "/shapes.txt");
-    if (!shapes) throw std::runtime_error("cannot open shapes.txt");
-    MLP m;
-    int n_test;
-    shapes >> m.in_dim >> m.hidden_dim >> m.out_dim >> n_test;
-
-    m.W1 = load_f32(artifacts_dir + "/fc1_weight.bin", static_cast<size_t>(m.hidden_dim) * m.in_dim);
-    m.b1 = load_f32(artifacts_dir + "/fc1_bias.bin", m.hidden_dim);
-    m.W2 = load_f32(artifacts_dir + "/fc2_weight.bin", static_cast<size_t>(m.out_dim) * m.hidden_dim);
-    m.b2 = load_f32(artifacts_dir + "/fc2_bias.bin", m.out_dim);
-    return m;
-}
+#include "mlp_model.hpp"
 
 void run_mode(const std::string& artifacts_dir) {
     auto t0 = Clock::now();
-    MLP m = load_model(artifacts_dir);
+    MLP m = load_mlp(artifacts_dir);
     std::ifstream shapes(artifacts_dir + "/shapes.txt");
     int in_dim, hidden_dim, out_dim, n_test;
     shapes >> in_dim >> hidden_dim >> out_dim >> n_test;
@@ -72,7 +38,7 @@ void run_mode(const std::string& artifacts_dir) {
 
 void bench_mode(const std::string& artifacts_dir) {
     auto t_start = Clock::now();
-    MLP m = load_model(artifacts_dir);
+    MLP m = load_mlp(artifacts_dir);
     auto cold_start_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
 
     const int WARMUP = 50, ITERS = 500;
@@ -106,7 +72,7 @@ void bench_mode(const std::string& artifacts_dir) {
 // orchestrator times the WHOLE subprocess from outside, so this mode
 // deliberately does no internal timing or printing of its own.
 void once_mode(const std::string& artifacts_dir) {
-    MLP m = load_model(artifacts_dir);
+    MLP m = load_mlp(artifacts_dir);
     std::vector<float> x(m.in_dim, 0.1f);
     auto y = m.forward(x, 1);
     asm volatile("" : : "g"(y.data()) : "memory");  // prevent the optimizer from eliding the call
