@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 native/mlp
 native/transformer
+native/gemm_bench
