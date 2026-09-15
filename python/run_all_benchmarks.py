@@ -6,29 +6,11 @@ separately in research/environment.md.
 """
 import json
 import pathlib
-import re
-import subprocess
+
+from bench_common import run_timed, dir_size_mb
 
 ROOT = pathlib.Path(__file__).parent.parent
 ARTIFACTS = ROOT / "artifacts"
-RSS_RE = re.compile(r"(\d+)\s+maximum resident set size")
-
-
-def run_timed(cmd, cwd=None):
-    proc = subprocess.run(
-        ["/usr/bin/time", "-l", *cmd], cwd=cwd, capture_output=True, text=True
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"{cmd} failed:\n{proc.stdout}\n{proc.stderr}")
-    json_line = next(line for line in proc.stdout.splitlines() if line.strip().startswith("{"))
-    result = json.loads(json_line)
-    m = RSS_RE.search(proc.stderr)
-    result["peak_rss_mb"] = int(m.group(1)) / 1e6 if m else None
-    return result
-
-
-def dir_size_mb(path):
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6
 
 
 def main():

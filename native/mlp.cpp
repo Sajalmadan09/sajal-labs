@@ -9,7 +9,6 @@
 #include <Accelerate/Accelerate.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -18,54 +17,24 @@
 #include <string>
 #include <vector>
 
-using Clock = std::chrono::steady_clock;
-
-std::vector<float> load_f32(const std::string& path, size_t count) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    std::vector<float> data(count);
-    f.read(reinterpret_cast<char*>(data.data()), count * sizeof(float));
-    if (!f) throw std::runtime_error("short read: " + path);
-    return data;
-}
+#include "common.hpp"
 
 struct MLP {
     int in_dim, hidden_dim, out_dim;
     std::vector<float> W1, b1, W2, b2;  // W1:[hidden,in]  W2:[out,hidden]
 
     // X:[n,in] row-major -> returns Y:[n,out] row-major, softmax applied per row.
+    // Built from the shared op library in common.hpp — see its comments for
+    // why W's [out,in] layout needs no physical transpose, and why softmax
+    // subtracts the row max first.
     std::vector<float> forward(const std::vector<float>& X, int n) const {
         std::vector<float> H(static_cast<size_t>(n) * hidden_dim);
-        // H = X * W1^T.  W1 is stored [hidden,in] (PyTorch's nn.Linear layout),
-        // so CblasTrans on W1 gives exactly the [in,hidden] operand we need —
-        // no physical transpose required, BLAS does it via the trans flag.
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, hidden_dim, in_dim,
-                    1.0f, X.data(), in_dim, W1.data(), in_dim, 0.0f, H.data(), hidden_dim);
-        for (int i = 0; i < n; ++i) {
-            float* row = H.data() + static_cast<size_t>(i) * hidden_dim;
-            for (int j = 0; j < hidden_dim; ++j) {
-                float v = row[j] + b1[j];
-                row[j] = v > 0.0f ? v : 0.0f;  // ReLU
-            }
-        }
+        linear(X.data(), n, in_dim, W1.data(), b1.data(), hidden_dim, H.data());
+        relu_inplace(H.data(), H.size());
 
         std::vector<float> Y(static_cast<size_t>(n) * out_dim);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, out_dim, hidden_dim,
-                    1.0f, H.data(), hidden_dim, W2.data(), hidden_dim, 0.0f, Y.data(), out_dim);
-        for (int i = 0; i < n; ++i) {
-            float* row = Y.data() + static_cast<size_t>(i) * out_dim;
-            for (int j = 0; j < out_dim; ++j) row[j] += b2[j];
-            // Softmax, subtracting the row max first for numerical stability
-            // (avoids overflowing exp() on large logits) — standard practice,
-            // not something PyTorch's softmax skips either.
-            float mx = *std::max_element(row, row + out_dim);
-            float sum = 0.0f;
-            for (int j = 0; j < out_dim; ++j) {
-                row[j] = std::exp(row[j] - mx);
-                sum += row[j];
-            }
-            for (int j = 0; j < out_dim; ++j) row[j] /= sum;
-        }
+        linear(H.data(), n, hidden_dim, W2.data(), b2.data(), out_dim, Y.data());
+        softmax_rows(Y.data(), n, out_dim);
         return Y;
     }
 };
@@ -82,16 +51,6 @@ MLP load_model(const std::string& artifacts_dir) {
     m.W2 = load_f32(artifacts_dir + "/fc2_weight.bin", static_cast<size_t>(m.out_dim) * m.hidden_dim);
     m.b2 = load_f32(artifacts_dir + "/fc2_bias.bin", m.out_dim);
     return m;
-}
-
-double percentile(std::vector<double> v, double p) {
-    std::sort(v.begin(), v.end());
-    double idx = p / 100.0 * (v.size() - 1);
-    size_t lo = static_cast<size_t>(std::floor(idx));
-    size_t hi = static_cast<size_t>(std::ceil(idx));
-    if (lo == hi) return v[lo];
-    double frac = idx - lo;
-    return v[lo] * (1 - frac) + v[hi] * frac;  // matches numpy.percentile's default 'linear' method
 }
 
 void run_mode(const std::string& artifacts_dir) {

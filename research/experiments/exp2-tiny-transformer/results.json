@@ -1,0 +1,46 @@
+{
+  "experiment": "exp2-tiny-transformer",
+  "results": [
+    {
+      "impl": "native_cpp",
+      "cold_start_ms": 3.5712,
+      "warmup_iters": 50,
+      "iters": 500,
+      "mean_ms": 0.18586,
+      "p50_ms": 0.18556,
+      "p90_ms": 0.18825,
+      "p95_ms": 0.18959,
+      "p99_ms": 0.19627,
+      "peak_rss_mb": 10.73152
+    },
+    {
+      "impl": "pytorch_eager",
+      "cold_start_ms": 711.0520420001194,
+      "warmup_iters": 50,
+      "iters": 500,
+      "mean_ms": 0.26532934800707153,
+      "p50_ms": 0.2656040001056681,
+      "p90_ms": 0.2868791997570952,
+      "p95_ms": 0.2941353995083773,
+      "p99_ms": 0.32843375011907455,
+      "peak_rss_mb": 229.015552
+    },
+    {
+      "impl": "onnxruntime_cpu",
+      "cold_start_ms": 532.7533330000733,
+      "warmup_iters": 50,
+      "iters": 500,
+      "mean_ms": 0.1844464740024705,
+      "p50_ms": 0.18429200008540647,
+      "p90_ms": 0.19054610029343166,
+      "p95_ms": 0.19358714962436352,
+      "p99_ms": 0.21442200027195213,
+      "peak_rss_mb": 253.280256
+    }
+  ],
+  "dependency_footprint": {
+    "native_binary_mb": 0.058568,
+    "torch_site_packages_mb": 535.778582,
+    "onnxruntime_site_packages_mb": 78.277891
+  }
+}

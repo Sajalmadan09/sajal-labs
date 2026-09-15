@@ -1,10 +1,15 @@
 CXX = clang++
 CXXFLAGS = -O3 -std=c++17 -Wall -Wextra -DACCELERATE_NEW_LAPACK -framework Accelerate
 
-mlp: mlp.cpp
+all: mlp transformer
+
+mlp: mlp.cpp common.hpp
 	$(CXX) $(CXXFLAGS) -o mlp mlp.cpp
 
-clean:
-	rm -f mlp
+transformer: transformer.cpp common.hpp
+	$(CXX) $(CXXFLAGS) -o transformer transformer.cpp
 
-.PHONY: clean
+clean:
+	rm -f mlp transformer
+
+.PHONY: clean all
