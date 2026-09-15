@@ -140,6 +140,7 @@ tags:
 - transformer
 - feature-extraction
 base_model: {BASE_MODEL}
+base_model_relation: finetune
 pipeline_tag: feature-extraction
 ---
 

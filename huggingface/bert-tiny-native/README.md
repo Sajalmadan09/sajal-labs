@@ -9,6 +9,7 @@ tags:
 - transformer
 - feature-extraction
 base_model: prajjwal1/bert-tiny
+base_model_relation: finetune
 pipeline_tag: feature-extraction
 ---
 
