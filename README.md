@@ -64,6 +64,7 @@ Model "kind" (`mlp`, `transformer`, `text-mlp`, or `bert`) is detected from what
 12. [Width vs. depth ablation](research/experiments/exp12-warm-latency-width-depth/results.md) — resolves exp11's warm-latency nuance: width (hidden_size) drives whether native retains an edge, not depth or toolchain
 13. [Width threshold](research/experiments/exp13-width-threshold/results.md) — pinpoints the crossover at hidden≈250 (this hardware/toolchain); smooth curve, not a cliff
 14. [WordPiece in C++](research/experiments/exp14-wordpiece-native/results.md) — real BERT tokenizer ported, exact token match on 17 real sentences; native beats even lean-tokenizer ONNX by 8.4x, and tokenizer library choice alone swings Python cold-start 26x
+15. [Minimal ONNX→C++ compiler](research/experiments/exp15-minimal-compiler/results.md) — the first real compiler, not a hand-port: auto-generated code from exp1/exp9's ONNX graphs is bit-identical to the hand-written reference, `sajal` CLI works on the output with zero modification, fails cleanly on out-of-scope graphs
 
 ## Roadmap
 
@@ -78,3 +79,4 @@ Model "kind" (`mlp`, `transformer`, `text-mlp`, or `bert`) is detected from what
 8. Transformer support — done (exp11: real pretrained BERT, [native/bert_model.hpp](native/bert_model.hpp), fp32-tight equivalence on 10 real sentences)
 9. Hardware optimization (SIMD/CUDA) — Apple Accelerate/AMX only so far; no CUDA hardware available
 10. Research publication
+11. Model compiler (ONNX → native C++, not hand-porting) — started (exp15: [python/sajal_compile.py](python/sajal_compile.py), 3 ops, bit-identical to hand-written reference; LayerNorm/GELU/attention not yet supported)
