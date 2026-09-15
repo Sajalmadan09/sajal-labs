@@ -2,3 +2,4 @@ numpy==2.5.3
 onnx==1.22.0
 onnxruntime==1.30.0
 torch==2.14.0
+safetensors==0.8.0

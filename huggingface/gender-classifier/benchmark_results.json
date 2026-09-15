@@ -1,0 +1,35 @@
+{
+  "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see research/environment.md)",
+  "methodology": "research/experiments/exp9-gender-classifier/results.md, exp10-e2e-native-pipeline/results.md",
+  "accuracy": {
+    "train": 0.9941860437393188,
+    "validation": 0.8181818127632141,
+    "train_n": 688,
+    "val_n": 121
+  },
+  "equivalence_native_vs_pytorch": {
+    "n_test": 121,
+    "max_abs_error": 1.1920928955078125e-07,
+    "mean_abs_error": 5.110488476844921e-09,
+    "rmse": 1.515906511428966e-08,
+    "mean_cosine_similarity": 1.0,
+    "prediction_agreement": 1.0,
+    "tolerance_note": "fp32 matmul via BLAS (Accelerate) vs PyTorch's own kernels; operation-order differences are expected per IEEE-754 non-associativity, not a bug. See research/papers.md sections 8-9."
+  },
+  "cold_invocation_ms_p50": {
+    "native": 3.801437000220176,
+    "native_end_to_end_raw_text": 4.056875499372836,
+    "onnx_runtime_cpu": 75.52345800013427,
+    "pytorch_eager": 584.5437710004262
+  },
+  "warm_loop_ms_p50": {
+    "native": 0.00067,
+    "onnx_runtime_cpu": 0.0047909998102113605,
+    "pytorch_eager": 0.008958000762504525
+  },
+  "peak_rss_mb": {
+    "native": 5.89824,
+    "onnx_runtime_cpu": 58.769408,
+    "pytorch_eager": 217.57952
+  }
+}

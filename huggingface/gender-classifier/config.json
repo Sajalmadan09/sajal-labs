@@ -1,0 +1,17 @@
+{
+  "architecture": "linear_relu_linear_softmax",
+  "task": "text-classification",
+  "in_dim": 343,
+  "hidden_dim": 64,
+  "out_dim": 2,
+  "labels": {
+    "0": "M",
+    "1": "F"
+  },
+  "feature_extraction": "character_bigram_bag_of_ngrams",
+  "vocab_size": 343,
+  "num_parameters": 22146,
+  "precision": "fp32",
+  "original_framework": "pytorch",
+  "sajal_runtime_compatible": true
+}
