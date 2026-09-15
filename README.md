@@ -39,6 +39,7 @@ not sustained high-throughput serving.
 7. [Cold invocation](research/experiments/exp7-cold-invocation/results.md) — the pivot, with a bug found and corrected along the way
 8. [Cold invocation sweep](research/experiments/exp8-cold-invocation-sweep/results.md) — pivot confirmed across all 6 sizes
 9. [Gender classifier](research/experiments/exp9-gender-classifier/results.md) — real trained model on real data, pivot holds
+10. [End-to-end native pipeline](research/experiments/exp10-e2e-native-pipeline/results.md) — feature extraction ported to C++, raw string in / prediction out, zero Python
 
 ## Roadmap
 

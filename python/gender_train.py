@@ -100,6 +100,9 @@ def main():
     save_f32(artifacts_dir / "fc2_bias.bin", model.fc2.bias)
     torch.save(model.state_dict(), artifacts_dir / "model_state_dict.pt")
     (artifacts_dir / "vocab.txt").write_text("\n".join(vocab))
+    # Raw val names, same order as test_inputs.bin/ref_outputs.bin — lets exp10
+    # test true end-to-end (raw string in) equivalence, not just precomputed-features.
+    (artifacts_dir / "val_names.txt").write_text("\n".join(n for n, _ in val))
 
     n_test = len(val)
     (artifacts_dir / "shapes.txt").write_text(f"{len(vocab)} {HIDDEN_DIM} 2 {n_test}\n")

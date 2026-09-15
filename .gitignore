@@ -5,3 +5,4 @@ __pycache__/
 native/mlp
 native/transformer
 native/gemm_bench
+native/gender_predict
