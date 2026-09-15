@@ -14,9 +14,13 @@
 // and reused across every forward() call, rather than freshly heap-allocated
 // per call. exp3 (research/experiments/exp3-size-sweep/results.md) found
 // native C++ lost its warm-latency edge over ONNX Runtime at every tested
-// transformer size, and named per-call allocation (~10 std::vectors per
-// forward() vs. ONNX Runtime's reused memory arena) as the likely cause,
-// not tested — this file is that test.
+// transformer size; exp4 ruled out per-call allocation as the cause; exp5
+// isolated the real mechanism — cblas_sgemm's fixed per-call dispatch cost
+// dominates at the small attention-head matmul size, confirmed by a
+// microbenchmark. This version acts on that: multi-head attention is
+// computed via common.hpp's multi_head_attention_naive() (zero BLAS calls)
+// instead of 2*n_heads separate cblas_sgemm calls — see exp6's results for
+// whether that actually closes the gap with ONNX Runtime.
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -65,21 +69,8 @@ struct TransformerBlock {
         linear(X.data(), S, D, Wv.data(), bv.data(), D, V.data());
 
         const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
-        for (int h = 0; h < H; ++h) {
-            const float* Qh = Q.data() + h * Dh;
-            const float* Kh = K.data() + h * Dh;
-            const float* Vh = V.data() + h * Dh;
-            // scores = (Qh @ Kh^T) * scale.  Qh, Kh are [S,Dh] slices with row
-            // stride D (that's what the trailing "D" args are — see file comment).
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, S, Dh, scale, Qh, D, Kh, D,
-                        0.0f, scores.data(), S);
-            softmax_rows(scores.data(), S, S);
-            // ctx[:, h] = scores @ Vh — write straight into this head's column
-            // slice of ctx (ldc=D) instead of a temporary that gets copied in.
-            float* ctx_h = ctx.data() + h * Dh;
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, Dh, S, 1.0f, scores.data(),
-                        S, Vh, D, 0.0f, ctx_h, D);
-        }
+        multi_head_attention_naive(Q.data(), K.data(), V.data(), ctx.data(), S, H, Dh, scale,
+                                    scores.data());
 
         linear(ctx.data(), S, D, Wo.data(), bo.data(), D, attn_out.data());
 

@@ -75,6 +75,44 @@ inline void softmax_rows(float* data, int rows, int cols) {
     }
 }
 
+// Multi-head self-attention computed WITHOUT calling into cblas_sgemm.
+// exp5 (research/experiments/exp5-gemm-dispatch-overhead/results.md) found
+// Accelerate's per-cblas_sgemm-call dispatch cost dominates at exactly this
+// matmul size (seq_len x d_head), and Accelerate has no batched-GEMM
+// primitive (checked: no cblas_?gemm_batch in the SDK headers) to fold the
+// per-head loop into one call. So instead of calling BLAS 2*n_heads times,
+// this hand-writes the (small, memory-bound) score and context matmuls
+// directly — trading "optimized kernel, called many times" for "naive
+// kernel, called zero times", testing exp5's finding that at this size the
+// call overhead outweighs BLAS's compute advantage.
+// Q,K,V: [S,D] row-major, D = H*Dh (head h occupies columns [h*Dh,(h+1)*Dh)).
+// ctx: [S,D] output. scores_scratch: reused [S,S] buffer, caller-owned.
+inline void multi_head_attention_naive(const float* Q, const float* K, const float* V, float* ctx,
+                                        int S, int H, int Dh, float scale, float* scores_scratch) {
+    int D = H * Dh;
+    for (int h = 0; h < H; ++h) {
+        for (int i = 0; i < S; ++i) {
+            const float* qi = Q + static_cast<size_t>(i) * D + h * Dh;
+            for (int j = 0; j < S; ++j) {
+                const float* kj = K + static_cast<size_t>(j) * D + h * Dh;
+                float sum = 0.0f;
+                for (int d = 0; d < Dh; ++d) sum += qi[d] * kj[d];
+                scores_scratch[i * S + j] = sum * scale;
+            }
+        }
+        softmax_rows(scores_scratch, S, S);
+        for (int i = 0; i < S; ++i) {
+            float* ctx_i = ctx + static_cast<size_t>(i) * D + h * Dh;
+            for (int d = 0; d < Dh; ++d) ctx_i[d] = 0.0f;
+            for (int j = 0; j < S; ++j) {
+                float a = scores_scratch[i * S + j];
+                const float* vj = V + static_cast<size_t>(j) * D + h * Dh;
+                for (int d = 0; d < Dh; ++d) ctx_i[d] += a * vj[d];
+            }
+        }
+    }
+}
+
 inline void layernorm_rows(float* data, int rows, int cols, const float* gamma, const float* beta,
                             float eps = 1e-5f) {
     for (int i = 0; i < rows; ++i) {
