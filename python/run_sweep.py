@@ -11,6 +11,7 @@ instead of introducing a second free variable.
 import json
 import pathlib
 import subprocess
+import sys
 
 from bench_common import run_timed, dir_size_mb
 from export_transformer import export
@@ -18,6 +19,7 @@ from export_transformer import export
 ROOT = pathlib.Path(__file__).parent.parent
 SEQ_LEN, N_HEADS = 32, 4
 D_MODELS = [16, 32, 64, 128, 192, 256]
+EXPERIMENT_NAME = sys.argv[1] if len(sys.argv) > 1 else "exp3-size-sweep"
 
 
 def run_one(d_model):
@@ -60,8 +62,8 @@ def main():
               f"native={r['native_p50_ms']:.5f}ms  onnx={r['onnx_p50_ms']:.5f}ms  "
               f"native_vs_onnx={r['native_vs_onnx']:.2f}x")
 
-    out = {"experiment": "exp3-size-sweep", "seq_len": SEQ_LEN, "n_heads": N_HEADS, "rows": rows}
-    out_dir = ROOT / "research/experiments/exp3-size-sweep"
+    out = {"experiment": EXPERIMENT_NAME, "seq_len": SEQ_LEN, "n_heads": N_HEADS, "rows": rows}
+    out_dir = ROOT / "research/experiments" / EXPERIMENT_NAME
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.json").write_text(json.dumps(out, indent=2))
     print(f"\nwrote {out_dir / 'results.json'}")

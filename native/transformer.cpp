@@ -9,6 +9,14 @@
 // be wider than the columns actually used. So each head's [seq,d_head]
 // submatrix is addressed directly (pointer + d_model as the stride) with
 // zero copying, instead of physically splitting Q/K/V into per-head arrays.
+//
+// Scratch buffers (Q, K, V, ctx, ...) are allocated ONCE in allocate_buffers()
+// and reused across every forward() call, rather than freshly heap-allocated
+// per call. exp3 (research/experiments/exp3-size-sweep/results.md) found
+// native C++ lost its warm-latency edge over ONNX Runtime at every tested
+// transformer size, and named per-call allocation (~10 std::vectors per
+// forward() vs. ONNX Runtime's reused memory arena) as the likely cause,
+// not tested — this file is that test.
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -24,17 +32,38 @@ struct TransformerBlock {
     std::vector<float> W1, b1, W2, b2;
     std::vector<float> ln2_w, ln2_b;
 
-    // X:[seq_len,d_model] row-major -> returns [seq_len,d_model].
-    std::vector<float> forward(const std::vector<float>& X) const {
+    // Scratch space, sized once by allocate_buffers() after shapes are known.
+    // `mutable` because forward() stays logically const (same weights, same
+    // math) even though it writes into this reused scratch space — the
+    // mutability is an implementation detail (a cache), not part of the
+    // object's observable state.
+    mutable std::vector<float> Q, K, V, ctx, scores, attn_out, x1, ff_hidden, ff_out, x2;
+
+    void allocate_buffers() {
+        size_t SD = static_cast<size_t>(seq_len) * d_model;
+        Q.resize(SD);
+        K.resize(SD);
+        V.resize(SD);
+        ctx.resize(SD);
+        scores.resize(static_cast<size_t>(seq_len) * seq_len);
+        attn_out.resize(SD);
+        x1.resize(SD);
+        ff_hidden.resize(static_cast<size_t>(seq_len) * d_ff);
+        ff_out.resize(SD);
+        x2.resize(SD);
+    }
+
+    // X:[seq_len,d_model] row-major -> returns a reference to this object's
+    // internal x2 buffer (valid until the next forward() call — the caller
+    // must copy it out before calling forward() again, same contract as any
+    // reused scratch buffer / object pool).
+    const std::vector<float>& forward(const std::vector<float>& X) const {
         const int S = seq_len, D = d_model, H = n_heads, Dh = d_head, F = d_ff;
 
-        std::vector<float> Q(static_cast<size_t>(S) * D), K(Q.size()), V(Q.size());
         linear(X.data(), S, D, Wq.data(), bq.data(), D, Q.data());
         linear(X.data(), S, D, Wk.data(), bk.data(), D, K.data());
         linear(X.data(), S, D, Wv.data(), bv.data(), D, V.data());
 
-        std::vector<float> ctx(Q.size());
-        std::vector<float> scores(static_cast<size_t>(S) * S);
         const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
         for (int h = 0; h < H; ++h) {
             const float* Qh = Q.data() + h * Dh;
@@ -52,21 +81,16 @@ struct TransformerBlock {
                         S, Vh, D, 0.0f, ctx_h, D);
         }
 
-        std::vector<float> attn_out(Q.size());
         linear(ctx.data(), S, D, Wo.data(), bo.data(), D, attn_out.data());
 
-        std::vector<float> x1(Q.size());
         for (size_t i = 0; i < x1.size(); ++i) x1[i] = X[i] + attn_out[i];  // residual
         layernorm_rows(x1.data(), S, D, ln1_w.data(), ln1_b.data());
 
-        std::vector<float> ff_hidden(static_cast<size_t>(S) * F);
         linear(x1.data(), S, D, W1.data(), b1.data(), F, ff_hidden.data());
         gelu_inplace(ff_hidden.data(), ff_hidden.size());
 
-        std::vector<float> ff_out(Q.size());
         linear(ff_hidden.data(), S, F, W2.data(), b2.data(), D, ff_out.data());
 
-        std::vector<float> x2(Q.size());
         for (size_t i = 0; i < x2.size(); ++i) x2[i] = x1[i] + ff_out[i];  // residual
         layernorm_rows(x2.data(), S, D, ln2_w.data(), ln2_b.data());
         return x2;
@@ -96,6 +120,7 @@ TransformerBlock load_model(const std::string& artifacts_dir) {
     m.ln1_b = load_f32(artifacts_dir + "/ln1_bias.bin", m.d_model);
     m.ln2_w = load_f32(artifacts_dir + "/ln2_weight.bin", m.d_model);
     m.ln2_b = load_f32(artifacts_dir + "/ln2_bias.bin", m.d_model);
+    m.allocate_buffers();
     return m;
 }
 
@@ -110,10 +135,11 @@ void run_mode(const std::string& artifacts_dir) {
                            static_cast<size_t>(n_test) * seq_len * d_model);
 
     std::vector<float> outputs(static_cast<size_t>(n_test) * seq_len * d_model);
+    std::vector<float> x(static_cast<size_t>(seq_len) * d_model);  // reused per-test-vector input buffer
     for (int t = 0; t < n_test; ++t) {
-        std::vector<float> x(X_all.begin() + static_cast<size_t>(t) * seq_len * d_model,
-                              X_all.begin() + static_cast<size_t>(t + 1) * seq_len * d_model);
-        auto y = m.forward(x);
+        std::copy(X_all.begin() + static_cast<size_t>(t) * seq_len * d_model,
+                  X_all.begin() + static_cast<size_t>(t + 1) * seq_len * d_model, x.begin());
+        const auto& y = m.forward(x);
         std::copy(y.begin(), y.end(), outputs.begin() + static_cast<size_t>(t) * seq_len * d_model);
     }
 
@@ -139,7 +165,7 @@ void bench_mode(const std::string& artifacts_dir) {
     latencies_ms.reserve(ITERS);
     for (int i = 0; i < ITERS; ++i) {
         auto t0 = Clock::now();
-        auto y = m.forward(x);
+        const auto& y = m.forward(x);
         latencies_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         asm volatile("" : : "g"(y.data()) : "memory");  // prevent the optimizer from eliding the call
     }
