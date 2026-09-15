@@ -1,0 +1,179 @@
+{
+  "experiment": "exp9-gender-classifier",
+  "training_metrics": {
+    "train_n": 688,
+    "val_n": 121,
+    "vocab_size": 343,
+    "train_acc": 0.9941860437393188,
+    "val_acc": 0.8181818127632141,
+    "examples": [
+      {
+        "name": "karan",
+        "true": "M",
+        "pred": "M",
+        "confidence": 0.984
+      },
+      {
+        "name": "vinita",
+        "true": "F",
+        "pred": "F",
+        "confidence": 0.986
+      },
+      {
+        "name": "chandran",
+        "true": "M",
+        "pred": "M",
+        "confidence": 1.0
+      },
+      {
+        "name": "mrunal",
+        "true": "F",
+        "pred": "M",
+        "confidence": 0.983
+      },
+      {
+        "name": "jayalakshmi",
+        "true": "F",
+        "pred": "F",
+        "confidence": 0.998
+      },
+      {
+        "name": "ismail",
+        "true": "M",
+        "pred": "M",
+        "confidence": 0.848
+      },
+      {
+        "name": "kiran",
+        "true": "F",
+        "pred": "M",
+        "confidence": 0.865
+      },
+      {
+        "name": "gopal",
+        "true": "M",
+        "pred": "M",
+        "confidence": 1.0
+      },
+      {
+        "name": "moloya",
+        "true": "F",
+        "pred": "F",
+        "confidence": 0.998
+      },
+      {
+        "name": "subramanian",
+        "true": "M",
+        "pred": "M",
+        "confidence": 1.0
+      },
+      {
+        "name": "meera",
+        "true": "F",
+        "pred": "F",
+        "confidence": 0.975
+      },
+      {
+        "name": "naresh",
+        "true": "M",
+        "pred": "M",
+        "confidence": 0.99
+      },
+      {
+        "name": "uma",
+        "true": "F",
+        "pred": "F",
+        "confidence": 0.969
+      },
+      {
+        "name": "safia",
+        "true": "F",
+        "pred": "M",
+        "confidence": 0.606
+      },
+      {
+        "name": "vel",
+        "true": "M",
+        "pred": "M",
+        "confidence": 0.979
+      }
+    ]
+  },
+  "equivalence": {
+    "n_test": 121,
+    "max_abs_error": 1.1920928955078125e-07,
+    "mean_abs_error": 5.110488476844921e-09,
+    "rmse": 1.515906511428966e-08,
+    "mean_cosine_similarity": 1.0,
+    "prediction_agreement": 1.0,
+    "tolerance_note": "fp32 matmul via BLAS (Accelerate) vs PyTorch's own kernels; operation-order differences are expected per IEEE-754 non-associativity, not a bug. See research/papers.md sections 8-9."
+  },
+  "cold_invocation": [
+    {
+      "impl": "native",
+      "trials": 30,
+      "mean_ms": 3.8773318333672555,
+      "p50_ms": 3.801437000220176,
+      "p90_ms": 4.17379579939734,
+      "p95_ms": 4.23332050031604,
+      "p99_ms": 5.7749912098734075
+    },
+    {
+      "impl": "pytorch",
+      "trials": 30,
+      "mean_ms": 584.4641944999239,
+      "p50_ms": 584.5437710004262,
+      "p90_ms": 601.2422584004526,
+      "p95_ms": 602.4993459508551,
+      "p99_ms": 788.4924804993173
+    },
+    {
+      "impl": "onnx",
+      "trials": 30,
+      "mean_ms": 76.3988152334908,
+      "p50_ms": 75.52345800013427,
+      "p90_ms": 80.66355449918774,
+      "p95_ms": 84.07301019988152,
+      "p99_ms": 119.54669277922225
+    }
+  ],
+  "warm_loop": [
+    {
+      "impl": "native_cpp",
+      "cold_start_ms": 0.0998,
+      "warmup_iters": 50,
+      "iters": 500,
+      "mean_ms": 0.00068,
+      "p50_ms": 0.00067,
+      "p90_ms": 0.00071,
+      "p95_ms": 0.00071,
+      "p99_ms": 0.00071,
+      "peak_rss_mb": 5.89824
+    },
+    {
+      "impl": "pytorch_eager",
+      "cold_start_ms": 451.98954199986474,
+      "warmup_iters": 50,
+      "iters": 500,
+      "mean_ms": 0.009558222009218298,
+      "p50_ms": 0.008958000762504525,
+      "p90_ms": 0.012291999155422673,
+      "p95_ms": 0.013127049896866081,
+      "p99_ms": 0.0161703295634652,
+      "peak_rss_mb": 217.57952
+    },
+    {
+      "impl": "onnxruntime_cpu",
+      "cold_start_ms": 49.41520800093713,
+      "warmup_iters": 50,
+      "iters": 500,
+      "mean_ms": 0.005209471994021442,
+      "p50_ms": 0.0047909998102113605,
+      "p90_ms": 0.005791000148747116,
+      "p95_ms": 0.005962201521469975,
+      "p99_ms": 0.015943669477564957,
+      "peak_rss_mb": 58.769408
+    }
+  ],
+  "native_binary_mb": 0.041648
+}

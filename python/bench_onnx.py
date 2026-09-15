@@ -4,6 +4,7 @@ import sys
 import time
 
 ONCE = "--once" in sys.argv
+_positional = [a for a in sys.argv[1:] if not a.startswith("--")]
 
 t_start = time.perf_counter()
 
@@ -12,7 +13,9 @@ import onnxruntime as ort  # noqa: E402
 
 from bench_common import time_calls, percentiles  # noqa: E402
 
-ARTIFACTS = pathlib.Path(__file__).parent.parent / "artifacts"
+ARTIFACTS = pathlib.Path(_positional[0]) if _positional else (
+    pathlib.Path(__file__).parent.parent / "artifacts"
+)
 IN_DIM = int((ARTIFACTS / "shapes.txt").read_text().split()[0])  # avoid importing tiny_mlp (pulls in torch)
 
 so = ort.SessionOptions()

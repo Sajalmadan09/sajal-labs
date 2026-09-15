@@ -7,10 +7,13 @@ small and explainable, not that it's zero.
 """
 import json
 import pathlib
+import sys
 
 import numpy as np
 
-ARTIFACTS = pathlib.Path(__file__).parent.parent / "artifacts"
+ARTIFACTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    pathlib.Path(__file__).parent.parent / "artifacts"
+)
 
 
 def main():
