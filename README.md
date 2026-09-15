@@ -28,6 +28,19 @@ ONNX Runtime CPU for any transformer-shaped model tested. Target use case:
 serverless functions, CLI tools, intermittently-invoked edge devices —
 not sustained high-throughput serving.
 
+## CLI
+
+```bash
+cd native && make sajal
+./sajal inspect <artifacts_dir>          # detects model kind, shows dims/vocab/size
+./sajal run <artifacts_dir> [text]       # single prediction; text required for text-mlp kind
+./sajal bench <artifacts_dir>            # warmup + 500-iteration timed loop, same format as mlp/transformer's bench mode
+```
+
+Model "kind" (`mlp`, `transformer`, or `text-mlp`) is detected from what's already in the artifacts directory — a `vocab.txt` means text input (exp9/10's shape), `shapes.txt`'s field count distinguishes plain MLP (exp1's shape) from transformer (exp2-8's shape) — no new manifest format invented for this.
+
+`sajal` links the same model headers (`mlp_model.hpp`, `transformer_model.hpp`, `text_features.hpp`) directly and does inference in-process, rather than shelling out to `mlp`/`transformer`/`gender_predict` — those stay exactly as they are as dedicated, minimal, unchanged binaries, since exp1-10's benchmark numbers depend on them not having a dispatch layer. Verified empirically that this design choice matters: `sajal run` cold-invocation latency (2.90ms p50) matches the dedicated `gender_predict once` binary (2.94ms p50) almost exactly, despite the larger linked binary — shelling out would have doubled process-startup cost and undermined the very thing ten experiments were measuring.
+
 ## Experiments
 
 1. [Tiny MLP](research/experiments/exp1-tiny-mlp/results.md) — equivalence + benchmark harness established
@@ -49,7 +62,7 @@ not sustained high-throughput serving.
 3. Model equivalence (real trained model) — done (exp9: real Indian-name gender classifier, 100% prediction agreement)
 4. Benchmarking vs. strong baselines — done, revised toward cold-invocation
 5. Packaging
-6. Developer experience (CLI)
+6. Developer experience (CLI) — done ([native/sajal.cpp](native/sajal.cpp): `inspect`/`run`/`bench`, in-process dispatch across model kinds)
 7. Hugging Face integration
 8. Transformer support — architecture proven (exp2-8); real pretrained transformer not yet tried (exp9 used the MLP architecture)
 9. Hardware optimization (SIMD/CUDA) — Apple Accelerate/AMX only so far; no CUDA hardware available
