@@ -1,0 +1,48 @@
+{
+  "experiment": "exp13-width-sweep",
+  "seq_len": 12,
+  "num_layers": 1,
+  "rows": [
+    {
+      "hidden": 64,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.02171,
+      "onnx_p50_ms": 0.05012500150769483,
+      "native_vs_onnx": 2.30884392020704
+    },
+    {
+      "hidden": 128,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.05271,
+      "onnx_p50_ms": 0.07472899960703216,
+      "native_vs_onnx": 1.4177385620761178
+    },
+    {
+      "hidden": 192,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.09156,
+      "onnx_p50_ms": 0.10816650046763243,
+      "native_vs_onnx": 1.1813728753564048
+    },
+    {
+      "hidden": 256,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.13562,
+      "onnx_p50_ms": 0.13310400026966818,
+      "native_vs_onnx": 0.9814481659760226
+    },
+    {
+      "hidden": 320,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.18796,
+      "onnx_p50_ms": 0.17077050051739207,
+      "native_vs_onnx": 0.908547034035923
+    }
+  ],
+  "estimated_crossover_hidden": 250.06117742416956
+}
