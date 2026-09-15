@@ -15,7 +15,7 @@ gemm_bench: gemm_bench.cpp common.hpp
 gender_predict: gender_predict.cpp mlp_model.hpp text_features.hpp common.hpp
 	$(CXX) $(CXXFLAGS) -o gender_predict gender_predict.cpp
 
-sajal: sajal.cpp mlp_model.hpp transformer_model.hpp text_features.hpp common.hpp
+sajal: sajal.cpp mlp_model.hpp transformer_model.hpp text_features.hpp bert_model.hpp wordpiece.hpp common.hpp
 	$(CXX) $(CXXFLAGS) -o sajal sajal.cpp
 
 bert: bert.cpp bert_model.hpp wordpiece.hpp common.hpp
