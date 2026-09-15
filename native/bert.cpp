@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "bert_model.hpp"
+#include "wordpiece.hpp"
 
 std::vector<int> load_i32(const std::string& path, size_t count) {
     std::ifstream f(path, std::ios::binary);
@@ -97,9 +98,69 @@ void once_mode(const std::string& artifacts_dir) {
     asm volatile("" : : "g"(out.pooled.data()) : "memory");
 }
 
+// exp14: tokenizes every sentence in tokenizer_test_sentences.txt with the
+// native WordPiece port, runs each through the encoder, and writes both
+// the token IDs (for the tokenizer-only check) and the full hidden/pooled
+// output per case (for the true end-to-end equivalence check) — this is
+// the deliverable: does raw-text-in-C++ match raw-text-in-HF all the way
+// through, not just at the tokenization step.
+void check_tokenizer_mode(const std::string& artifacts_dir) {
+    WordPieceTokenizer tok = load_tokenizer(artifacts_dir);
+    TinyBert m = load_bert(artifacts_dir);
+    std::ifstream f(artifacts_dir + "/tokenizer_test_sentences.txt");
+    if (!f) throw std::runtime_error("cannot open tokenizer_test_sentences.txt");
+
+    std::ofstream ids_out(artifacts_dir + "/tokenizer_check_native.txt");
+    std::string line;
+    int case_idx = 0;
+    while (std::getline(f, line)) {
+        auto tab = line.find('\t');
+        std::string text = line.substr(tab + 1);
+        auto ids = tok.tokenize(text);
+        for (size_t i = 0; i < ids.size(); ++i) ids_out << (i ? " " : "") << ids[i];
+        ids_out << "\n";
+
+        auto out = m.forward(ids);
+        std::string prefix = artifacts_dir + "/tokcase" + std::to_string(case_idx) + "_native_";
+        std::ofstream hout(prefix + "hidden.bin", std::ios::binary);
+        hout.write(reinterpret_cast<char*>(out.hidden.data()), out.hidden.size() * sizeof(float));
+        std::ofstream pout(prefix + "pooled.bin", std::ios::binary);
+        pout.write(reinterpret_cast<char*>(out.pooled.data()), out.pooled.size() * sizeof(float));
+        ++case_idx;
+    }
+}
+
+// exp14: true end-to-end — raw text in, prediction out, zero Python,
+// including tokenization this time (exp11's run/bench/once all took
+// precomputed token IDs). Prints the pooled [CLS] embedding's first few
+// values as a sanity-visible summary (printing all 128+ dims isn't useful
+// on a terminal).
+void predict_mode(const std::string& artifacts_dir, const std::string& text) {
+    WordPieceTokenizer tok = load_tokenizer(artifacts_dir);
+    TinyBert m = load_bert(artifacts_dir);
+    auto ids = tok.tokenize(text);
+    auto out = m.forward(ids);
+    std::printf("{\"text\": \"%s\", \"n_tokens\": %zu, \"pooled_preview\": [", text.c_str(), ids.size());
+    for (int i = 0; i < 5 && i < static_cast<int>(out.pooled.size()); ++i)
+        std::printf("%s%.6f", i ? ", " : "", out.pooled[i]);
+    std::printf("]}\n");
+}
+
+// exp14's cold-invocation mode: load model+tokenizer, tokenize a fixed
+// sentence, run the forward pass, exit — the full pipeline this time.
+void once_e2e_mode(const std::string& artifacts_dir) {
+    WordPieceTokenizer tok = load_tokenizer(artifacts_dir);
+    TinyBert m = load_bert(artifacts_dir);
+    auto ids = tok.tokenize("The quick brown fox jumps over the lazy dog.");
+    auto out = m.forward(ids);
+    asm volatile("" : : "g"(out.pooled.data()) : "memory");
+}
+
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "usage: " << argv[0] << " <artifacts_dir> <run|bench|once>\n";
+    if (argc < 3) {
+        std::cerr << "usage:\n"
+                  << "  " << argv[0] << " <artifacts_dir> run|bench|once|check_tokenizer|once_e2e\n"
+                  << "  " << argv[0] << " <artifacts_dir> predict <text>\n";
         return 1;
     }
     std::string artifacts_dir = argv[1], mode = argv[2];
@@ -110,8 +171,14 @@ int main(int argc, char** argv) {
             bench_mode(artifacts_dir);
         } else if (mode == "once") {
             once_mode(artifacts_dir);
+        } else if (mode == "check_tokenizer") {
+            check_tokenizer_mode(artifacts_dir);
+        } else if (mode == "predict" && argc == 4) {
+            predict_mode(artifacts_dir, argv[3]);
+        } else if (mode == "once_e2e") {
+            once_e2e_mode(artifacts_dir);
         } else {
-            std::cerr << "unknown mode: " << mode << "\n";
+            std::cerr << "unknown mode or wrong arg count: " << mode << "\n";
             return 1;
         }
     } catch (const std::exception& e) {

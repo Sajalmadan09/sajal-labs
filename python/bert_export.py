@@ -20,6 +20,7 @@ across that ablation.
 """
 import pathlib
 
+import numpy as np
 import torch
 from transformers import BertModel, BertTokenizerFast
 
@@ -42,6 +43,19 @@ TEST_SENTENCES = [
     "BERT was pretrained on masked language modeling and next sentence prediction.",
     "A tiny two-layer encoder is enough to test real equivalence.",
     "Cold invocation latency matters most for serverless and CLI tools.",
+]
+
+# exp14: trickier cases specifically stress-testing the WordPiece port —
+# punctuation splitting, hyphenation, contractions, out-of-vocabulary words
+# forcing multi-piece subword splits, extra whitespace.
+TOKENIZER_STRESS_SENTENCES = [
+    "don't worry, it's working!",
+    "unbelievably-fast native inference.",
+    "COVID-19 changed everything in 2020.",
+    "  extra   whitespace   everywhere  ",
+    "supercalifragilisticexpialidocious",
+    "email me at test@example.com, please.",
+    "Sajal's C++ port (hopefully) matches exactly.",
 ]
 
 
@@ -73,6 +87,30 @@ def main():
 
     example = tokenizer(TEST_SENTENCES[1], return_tensors="pt")
     export_bert_onnx(model, ARTIFACTS, example)
+
+    # --- exp14: vocab + tokenizer config, for the native WordPiece port ---
+    vocab_by_id = [None] * tokenizer.vocab_size
+    for tok, idx in tokenizer.get_vocab().items():
+        vocab_by_id[idx] = tok
+    (ARTIFACTS / "vocab.txt").write_text("\n".join(vocab_by_id))
+    (ARTIFACTS / "tokenizer_config.txt").write_text(
+        f"{int(tokenizer.do_lower_case)} {tokenizer.cls_token_id} {tokenizer.sep_token_id} "
+        f"{tokenizer.unk_token_id} {tokenizer.pad_token_id}\n"
+    )
+
+    stress_lengths = []
+    for i, text in enumerate(TOKENIZER_STRESS_SENTENCES):
+        encoded = tokenizer(text, return_tensors="pt")
+        ref_ids = encoded["input_ids"][0]
+        stress_lengths.append(len(ref_ids))
+        ref_ids.numpy().astype(np.int32).tofile(ARTIFACTS / f"tokcase{i}_ref_ids.bin")
+        with torch.no_grad():
+            out = model(**encoded)
+        save_f32(ARTIFACTS / f"tokcase{i}_ref_hidden.bin", out.last_hidden_state[0])
+        save_f32(ARTIFACTS / f"tokcase{i}_ref_pooled.bin", out.pooler_output[0])
+    (ARTIFACTS / "tokenizer_test_sentences.txt").write_text(
+        "\n".join(f"{n}\t{t}" for n, t in zip(stress_lengths, TOKENIZER_STRESS_SENTENCES))
+    )
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"exported {MODEL_NAME} to {ARTIFACTS}")

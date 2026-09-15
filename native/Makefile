@@ -18,7 +18,7 @@ gender_predict: gender_predict.cpp mlp_model.hpp text_features.hpp common.hpp
 sajal: sajal.cpp mlp_model.hpp transformer_model.hpp text_features.hpp common.hpp
 	$(CXX) $(CXXFLAGS) -o sajal sajal.cpp
 
-bert: bert.cpp bert_model.hpp common.hpp
+bert: bert.cpp bert_model.hpp wordpiece.hpp common.hpp
 	$(CXX) $(CXXFLAGS) -o bert bert.cpp
 
 clean:

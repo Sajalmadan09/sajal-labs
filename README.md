@@ -60,6 +60,7 @@ Model "kind" (`mlp`, `transformer`, or `text-mlp`) is detected from what's alrea
 11. [Real pretrained transformer](research/experiments/exp11-real-pretrained-transformer/results.md) — prajjwal1/bert-tiny (4.4M real params), fp32-tight equivalence on 10 real sentences, 582x cold-invocation win over PyTorch+transformers
 12. [Width vs. depth ablation](research/experiments/exp12-warm-latency-width-depth/results.md) — resolves exp11's warm-latency nuance: width (hidden_size) drives whether native retains an edge, not depth or toolchain
 13. [Width threshold](research/experiments/exp13-width-threshold/results.md) — pinpoints the crossover at hidden≈250 (this hardware/toolchain); smooth curve, not a cliff
+14. [WordPiece in C++](research/experiments/exp14-wordpiece-native/results.md) — real BERT tokenizer ported, exact token match on 17 real sentences; native beats even lean-tokenizer ONNX by 8.4x, and tokenizer library choice alone swings Python cold-start 26x
 
 ## Roadmap
 
