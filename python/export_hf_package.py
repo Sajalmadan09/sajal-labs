@@ -77,9 +77,11 @@ def main():
     onnx_warm = next(r for r in exp9["warm_loop"] if r["impl"] == "onnxruntime_cpu")
     pytorch_warm = next(r for r in exp9["warm_loop"] if r["impl"] == "pytorch_eager")
 
+    REPO = "https://github.com/Sajalmadan09/sajal-labs/tree/main"
     benchmark = {
-        "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see research/environment.md)",
-        "methodology": "research/experiments/exp9-gender-classifier/results.md, exp10-e2e-native-pipeline/results.md",
+        "hardware": f"Apple M4, 10 cores, 16GB RAM, macOS (see {REPO}/research/environment.md)",
+        "methodology": (f"{REPO}/research/experiments/exp9-gender-classifier/results.md, "
+                         f"{REPO}/research/experiments/exp10-e2e-native-pipeline/results.md"),
         "accuracy": {"train": training["train_acc"], "validation": training["val_acc"],
                      "train_n": training["train_n"], "val_n": training["val_n"]},
         "equivalence_native_vs_pytorch": exp9["equivalence"],
@@ -121,10 +123,12 @@ pipeline_tag: text-classification
 
 A small `Linear -> ReLU -> Linear -> Softmax` classifier over character-bigram
 features, predicting conventional gender (M/F) from an Indian first name.
-Built as the real-model case study for Sajal Labs — a research project on
-compiling trained models into minimal, dependency-free native C/C++ inference
-artifacts (not yet publicly hosted). See `research/experiments/exp9-gender-classifier`
-and `exp10-e2e-native-pipeline` in the Sajal Labs repo for the full methodology.
+Built as the real-model case study for [Sajal Labs](https://github.com/Sajalmadan09/sajal-labs) —
+a research project on compiling trained models into minimal, dependency-free
+native C/C++ inference artifacts. See
+[exp9-gender-classifier](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp9-gender-classifier)
+and [exp10-e2e-native-pipeline](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp10-e2e-native-pipeline)
+for the full methodology.
 
 ## Model details
 
@@ -193,9 +197,10 @@ weights = load_file("model.safetensors")   # fc1.weight, fc1.bias, fc2.weight, f
 config = json.load(open("config.json"))
 vocab = open("vocab.txt").read().splitlines()
 
-# See the Sajal Labs repo's python/gender_features.py for the exact bigram
-# feature extraction (must match, or predictions will be wrong) and
-# python/tiny_mlp.py for the exact forward pass these weights implement.
+# See https://github.com/Sajalmadan09/sajal-labs/blob/main/python/gender_features.py
+# for the exact bigram feature extraction (must match, or predictions will
+# be wrong) and python/tiny_mlp.py for the exact forward pass these weights
+# implement.
 ```
 
 ### ONNX Runtime

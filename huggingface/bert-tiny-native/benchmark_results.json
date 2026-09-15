@@ -1,6 +1,6 @@
 {
-  "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see research/environment.md)",
-  "methodology": "research/experiments/exp11-real-pretrained-transformer/results.md, exp12-warm-latency-width-depth/results.md, exp13-width-threshold/results.md, exp14-wordpiece-native/results.md",
+  "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see https://github.com/Sajalmadan09/sajal-labs/tree/main/research/environment.md)",
+  "methodology": "https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp11-real-pretrained-transformer/results.md, https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp12-warm-latency-width-depth/results.md, https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp13-width-threshold/results.md, https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp14-wordpiece-native/results.md",
   "equivalence_native_vs_pytorch": {
     "note": "native encoder + tokenizer vs. HF BertModel + BertTokenizerFast, 10 real sentences (lengths 4-25 tokens)",
     "hidden_state_max_abs_error": 9.5367431640625e-06,

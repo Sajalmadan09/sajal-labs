@@ -1,6 +1,6 @@
 {
-  "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see research/environment.md)",
-  "methodology": "research/experiments/exp9-gender-classifier/results.md, exp10-e2e-native-pipeline/results.md",
+  "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see https://github.com/Sajalmadan09/sajal-labs/tree/main/research/environment.md)",
+  "methodology": "https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp9-gender-classifier/results.md, https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp10-e2e-native-pipeline/results.md",
   "accuracy": {
     "train": 0.9941860437393188,
     "validation": 0.8181818127632141,

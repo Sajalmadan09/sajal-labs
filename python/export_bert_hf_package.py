@@ -91,11 +91,13 @@ def main():
     onnx_tf_e2e = next(r for r in exp14_cold["results"] if r["impl"] == "onnx_e2e_transformers")
     pytorch_e2e = next(r for r in exp14_cold["results"] if r["impl"] == "pytorch_e2e")
 
+    REPO = "https://github.com/Sajalmadan09/sajal-labs/tree/main"
     benchmark = {
-        "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see research/environment.md)",
-        "methodology": ("research/experiments/exp11-real-pretrained-transformer/results.md, "
-                         "exp12-warm-latency-width-depth/results.md, exp13-width-threshold/results.md, "
-                         "exp14-wordpiece-native/results.md"),
+        "hardware": f"Apple M4, 10 cores, 16GB RAM, macOS (see {REPO}/research/environment.md)",
+        "methodology": (f"{REPO}/research/experiments/exp11-real-pretrained-transformer/results.md, "
+                         f"{REPO}/research/experiments/exp12-warm-latency-width-depth/results.md, "
+                         f"{REPO}/research/experiments/exp13-width-threshold/results.md, "
+                         f"{REPO}/research/experiments/exp14-wordpiece-native/results.md"),
         "equivalence_native_vs_pytorch": {
             "note": "native encoder + tokenizer vs. HF BertModel + BertTokenizerFast, 10 real sentences (lengths 4-25 tokens)",
             "hidden_state_max_abs_error": equiv["hidden_max_abs_error_overall"],
@@ -153,8 +155,12 @@ cite both papers if you use this model** (citations below).
 **What Sajal Labs added**: a from-scratch native C++ port of the encoder
 and the WordPiece tokenizer — no PyTorch, no `transformers`, no Python at
 inference time — with rigorous equivalence and benchmark validation against
-the original. See `research/experiments/exp11-real-pretrained-transformer`
-through `exp14-wordpiece-native` in the Sajal Labs repo for full methodology.
+the original. See [Sajal Labs](https://github.com/Sajalmadan09/sajal-labs),
+experiments
+[exp11](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp11-real-pretrained-transformer)
+through
+[exp14](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp14-wordpiece-native),
+for full methodology.
 
 ## Model details (unchanged from the original)
 
@@ -195,12 +201,15 @@ Worth knowing before you read too much into "ONNX Runtime": its own cold-start
 number depends heavily on which tokenizer library it's paired with — using
 `transformers` for convenience costs ~25x more than using the lean, standalone
 `tokenizers` library for the exact same token IDs. Native sidesteps that
-whole dependency-choice question by construction. Full discussion in exp14.
+whole dependency-choice question by construction. Full discussion in
+[exp14](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp14-wordpiece-native).
 
 **Honest scope note on the warm-loop numbers**: native's advantage is
 *not* unconditional the way cold-invocation is — Sajal Labs found it
 depends on model width (`hidden_size`), with a measured crossover around
-`hidden≈250` on this hardware (exp12/exp13). This model's `hidden=128`
+`hidden≈250` on this hardware
+([exp12](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp12-warm-latency-width-depth)/[exp13](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp13-width-threshold)).
+This model's `hidden=128`
 sits comfortably below that, so native keeps a real warm-loop edge too —
 but that's a property of this model's size, not a general claim.
 

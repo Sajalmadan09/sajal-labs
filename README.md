@@ -1,5 +1,7 @@
 # Sajal Labs
 
+GitHub: [Sajalmadan09/sajal-labs](https://github.com/Sajalmadan09/sajal-labs)
+
 Native AI inference research: can trained ML models be transformed into
 minimal, dependency-light C/C++ inference artifacts without losing
 predictive fidelity — and when does that actually beat Python-based serving?

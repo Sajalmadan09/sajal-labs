@@ -16,10 +16,12 @@ pipeline_tag: text-classification
 
 A small `Linear -> ReLU -> Linear -> Softmax` classifier over character-bigram
 features, predicting conventional gender (M/F) from an Indian first name.
-Built as the real-model case study for Sajal Labs — a research project on
-compiling trained models into minimal, dependency-free native C/C++ inference
-artifacts (not yet publicly hosted). See `research/experiments/exp9-gender-classifier`
-and `exp10-e2e-native-pipeline` in the Sajal Labs repo for the full methodology.
+Built as the real-model case study for [Sajal Labs](https://github.com/Sajalmadan09/sajal-labs) —
+a research project on compiling trained models into minimal, dependency-free
+native C/C++ inference artifacts. See
+[exp9-gender-classifier](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp9-gender-classifier)
+and [exp10-e2e-native-pipeline](https://github.com/Sajalmadan09/sajal-labs/tree/main/research/experiments/exp10-e2e-native-pipeline)
+for the full methodology.
 
 ## Model details
 
@@ -88,9 +90,10 @@ weights = load_file("model.safetensors")   # fc1.weight, fc1.bias, fc2.weight, f
 config = json.load(open("config.json"))
 vocab = open("vocab.txt").read().splitlines()
 
-# See the Sajal Labs repo's python/gender_features.py for the exact bigram
-# feature extraction (must match, or predictions will be wrong) and
-# python/tiny_mlp.py for the exact forward pass these weights implement.
+# See https://github.com/Sajalmadan09/sajal-labs/blob/main/python/gender_features.py
+# for the exact bigram feature extraction (must match, or predictions will
+# be wrong) and python/tiny_mlp.py for the exact forward pass these weights
+# implement.
 ```
 
 ### ONNX Runtime
