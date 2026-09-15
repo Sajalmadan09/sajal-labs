@@ -100,9 +100,21 @@ void bench_mode(const std::string& artifacts_dir) {
         percentile(latencies_ms, 95), percentile(latencies_ms, 99));
 }
 
+// exp7: one cold invocation, one inference, exit — no warmup, no loop, no
+// output file. This is what a serverless/CLI/edge caller actually pays:
+// process start -> model ready -> one answer -> process teardown. The
+// orchestrator times the WHOLE subprocess from outside, so this mode
+// deliberately does no internal timing or printing of its own.
+void once_mode(const std::string& artifacts_dir) {
+    MLP m = load_model(artifacts_dir);
+    std::vector<float> x(m.in_dim, 0.1f);
+    auto y = m.forward(x, 1);
+    asm volatile("" : : "g"(y.data()) : "memory");  // prevent the optimizer from eliding the call
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
-        std::cerr << "usage: " << argv[0] << " <artifacts_dir> <run|bench>\n";
+        std::cerr << "usage: " << argv[0] << " <artifacts_dir> <run|bench|once>\n";
         return 1;
     }
     std::string artifacts_dir = argv[1], mode = argv[2];
@@ -111,6 +123,8 @@ int main(int argc, char** argv) {
             run_mode(artifacts_dir);
         } else if (mode == "bench") {
             bench_mode(artifacts_dir);
+        } else if (mode == "once") {
+            once_mode(artifacts_dir);
         } else {
             std::cerr << "unknown mode: " << mode << "\n";
             return 1;

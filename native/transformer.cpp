@@ -183,9 +183,18 @@ void bench_mode(const std::string& artifacts_dir) {
         percentile(latencies_ms, 95), percentile(latencies_ms, 99));
 }
 
+// exp7: one cold invocation, one inference, exit — see mlp.cpp's once_mode
+// for why this exists and why it deliberately does no internal timing.
+void once_mode(const std::string& artifacts_dir) {
+    TransformerBlock m = load_model(artifacts_dir);
+    std::vector<float> x(static_cast<size_t>(m.seq_len) * m.d_model, 0.1f);
+    const auto& y = m.forward(x);
+    asm volatile("" : : "g"(y.data()) : "memory");
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
-        std::cerr << "usage: " << argv[0] << " <artifacts_dir> <run|bench>\n";
+        std::cerr << "usage: " << argv[0] << " <artifacts_dir> <run|bench|once>\n";
         return 1;
     }
     std::string artifacts_dir = argv[1], mode = argv[2];
@@ -194,6 +203,8 @@ int main(int argc, char** argv) {
             run_mode(artifacts_dir);
         } else if (mode == "bench") {
             bench_mode(artifacts_dir);
+        } else if (mode == "once") {
+            once_mode(artifacts_dir);
         } else {
             std::cerr << "unknown mode: " << mode << "\n";
             return 1;

@@ -1,6 +1,9 @@
 import json
 import pathlib
+import sys
 import time
+
+ONCE = "--once" in sys.argv  # exp7: one cold invocation, one inference, no printing — see run_cold_invocation_bench.py
 
 t_start = time.perf_counter()
 
@@ -27,7 +30,10 @@ def step():
         model(x)
 
 
-latencies = time_calls(step)
-result = {"impl": "pytorch_eager", "cold_start_ms": cold_start_ms, "warmup_iters": 50, "iters": 500}
-result.update(percentiles(latencies))
-print(json.dumps(result))
+if ONCE:
+    step()
+else:
+    latencies = time_calls(step)
+    result = {"impl": "pytorch_eager", "cold_start_ms": cold_start_ms, "warmup_iters": 50, "iters": 500}
+    result.update(percentiles(latencies))
+    print(json.dumps(result))

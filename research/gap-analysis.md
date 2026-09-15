@@ -2,6 +2,8 @@
 
 Synthesis of [landscape.md](landscape.md) (CPU/edge runtimes), [related-work.md](related-work.md) (LLM-serving systems + compilers/math libs), and [papers.md](papers.md) (academic literature). This is judgment, not another research pass — the conclusions below are mine, weighing what the four surveys found against each other.
 
+> **Update after experiments 1-7 (2026-09-16): the value proposition below has been revised.** This doc originally (Phase 0, before any code existed) bet on native C++ being competitive on *warm per-call latency* for small/medium models, treating cold-start/footprint as a secondary benefit. Seven experiments later, that bet didn't pay off: native never beat ONNX Runtime CPU on warm latency for any transformer-shaped workload (exp2-6), even after diagnosing and testing two specific hypotheses (buffer allocation, BLAS dispatch overhead — exp4/exp5) and one direct fix attempt that made things worse (exp6). What held up in *every* experiment, consistently, regardless of model architecture: **cold-start (15-155x) and dependency-footprint (~10-40x) advantages** — see [exp7](experiments/exp7-cold-invocation/results.md). The project's value proposition is now **single-shot/cold-invocation latency and dependency footprint, not warm-server throughput** — this changes which of the niches below is actually load-bearing (see the revised MVP recommendation at the end of this document, added after the original).
+
 ## Where is the actual gap?
 
 Going through the candidate differentiators from the brief, checked against what the research actually found:
@@ -58,3 +60,26 @@ This is small enough to finish and be honest about, and it directly tests the pr
 - A new ML compiler IR/auto-scheduler (TVM/MLIR/IREE already solved this — related-work.md).
 - A new LLM runtime or GGUF-alternative format (llama.cpp owns this — related-work.md).
 - A production multi-tenant HTTP serving platform (Clipper/TensorFlow-Serving/TorchServe/OVMS territory — papers.md §6, landscape.md) — worth revisiting only after the compiler itself is validated.
+
+---
+
+## Revised recommendation (post-experiments, 2026-09-16): cold-invocation, not warm-throughput
+
+The gap identified above (§F+G, "per-model AOT compilation with measured numerical equivalence, for small/medium neural nets") is still the right technical niche — nothing in exp1-7 changed the ecosystem survey's conclusions. What changed is **which benefit of that niche is actually the load-bearing one.**
+
+**What the experiments showed:**
+- exp1 (trivial 2-matmul MLP): native won warm latency 6-13x. Looked like validation of the original "native beats framework dispatch overhead" thesis.
+- exp2 (transformer block, ~2,700x more compute): that warm-latency win nearly vanished (~1.0x, statistical tie with ONNX Runtime).
+- exp3 (size sweep, `d_model` 16-256): the tie wasn't about compute scale at all — even the *smallest* transformer tested was already at parity with ONNX Runtime, contradicting the "compute-bound vs. dispatch-bound crossover" theory from exp2.
+- exp4 (buffer-reuse fix): ruled out per-call heap allocation as the cause.
+- exp5 (GEMM dispatch microbenchmark): found the real mechanism — Accelerate's fixed per-`cblas_sgemm`-call cost dominates at attention-head matrix sizes, confirmed in isolation (up to 3.77x penalty for more calls at equal total work).
+- exp6 (hand-written attention, avoiding BLAS calls entirely): made things *worse* at every size — Accelerate's kernel efficiency (AMX/SIMD) outweighs its own dispatch overhead once you're not calling it at all.
+- exp7 (true cold-invocation latency, external wall-clock, both architectures): **15-155x faster than Python across both the MLP and the transformer**, a result that is consistent across architecture in a way none of the warm-latency numbers ever were.
+
+**The conclusion**: native C++'s reliable, architecture-independent advantage is in *not paying Python/framework process-startup cost* — not in out-computing a mature CPU runtime's matmul kernels. Warm-server throughput is very plausibly a losing or at-best-neutral battle against ONNX Runtime/PyTorch for this class of model; cold/single-shot invocation is a consistently large, easy-to-reproduce win.
+
+**What this means for Sajal Labs going forward:**
+- **Target use case narrows to**: serverless functions, CLI tools, edge/embedded devices invoked intermittently, batch/one-shot jobs — anywhere a fresh process (or fresh container) is paying import/load cost on (or near) every invocation. Explicitly **not** a target: high-throughput persistent inference servers handling sustained request volume, where warm latency and batching dominate and ONNX Runtime/vLLM-class systems are already strong (per landscape.md, related-work.md).
+- **RQ5's answer, now evidence-backed rather than hypothesized**: native provides a meaningful advantage specifically for cold/single-request invocation, essentially independent of model architecture or size (at least across the two architectures and size range tested) — not for sustained compute-bound serving.
+- **Numerical equivalence and dependency-footprint work remains exactly as valuable** — those findings (research/papers.md's identified gap around fp32 tolerance policy for native-compiled vs. framework-reference comparison) don't depend on which latency regime turns out to matter.
+- **Kernel-level micro-optimization (the exp4-exp6 line of work) is now lower priority.** Six experiments spent chasing warm-latency parity for transformer-shaped models produced one negative result and no net improvement; that effort is better spent broadening cold-invocation evidence (more model types/sizes, per exp7's suggested next experiment) and building toward the actual compiler, where the win is now known to come from generating a small, dependency-free, fast-to-load artifact — not from generating a kernel-competitive one.

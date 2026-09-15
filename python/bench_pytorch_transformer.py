@@ -10,7 +10,9 @@ import torch  # noqa: E402
 from tiny_transformer import TinyTransformerBlock  # noqa: E402
 from bench_common import time_calls, percentiles  # noqa: E402
 
-ARTIFACTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+ONCE = "--once" in sys.argv
+_positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+ARTIFACTS = pathlib.Path(_positional[0]) if _positional else (
     pathlib.Path(__file__).parent.parent / "artifacts" / "transformer"
 )
 
@@ -32,7 +34,10 @@ def step():
         model(x)
 
 
-latencies = time_calls(step)
-result = {"impl": "pytorch_eager", "cold_start_ms": cold_start_ms, "warmup_iters": 50, "iters": 500}
-result.update(percentiles(latencies))
-print(json.dumps(result))
+if ONCE:
+    step()
+else:
+    latencies = time_calls(step)
+    result = {"impl": "pytorch_eager", "cold_start_ms": cold_start_ms, "warmup_iters": 50, "iters": 500}
+    result.update(percentiles(latencies))
+    print(json.dumps(result))
