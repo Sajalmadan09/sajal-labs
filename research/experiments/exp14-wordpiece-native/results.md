@@ -41,7 +41,11 @@ Full data: [cold_invocation_results.json](cold_invocation_results.json).
 
 ## Interpretation
 
-This is the strongest version yet of the project's central finding, for two reasons. First, it holds even against the *best-case* Python deployment: native beats even the properly-optimized ONNX+lean-tokenizer combination by 8.4x, not just the convenient-but-heavy one. Second, it surfaces a finding bigger than this project's own scope: **cold-invocation performance is a property of the whole dependency chain, not just the inference engine** — Sajal Labs' native pipeline sidesteps this entire class of problem by construction (there's no separate "pick the right preprocessing library" decision to get right or wrong), while a Python deployment's actual cold-start number depends on library choices that have nothing to do with model architecture or inference framework.
+This is the strongest **end-to-end validation** yet of the project's central deployment hypothesis — not a claim that native inference is universally superior, but that for this real pretrained transformer, on this hardware, under a batch-1 cold-invocation workload, the fully native pipeline substantially reduces startup latency while preserving the model's behavior exactly. Two reasons this result is more defensible than exp7-13's:
+
+**The primary comparison is native (11.37ms) vs. ONNX Runtime + the lean `tokenizers` library (95.72ms) — an 8.4x advantage against the best-case Python deployment, not just the convenient-but-heavy one.** This is the number worth leading with: someone can no longer respond "you're only faster because `transformers` is bloated" — native wins even against a Python stack that got the dependency choice right. The 219.5x/437.5x figures against the heavier, more common `transformers`-based deployments are still real and still worth reporting, but as supporting evidence for the dependency-chain finding below, not as the headline.
+
+**Second, it surfaces a finding bigger than this project's own scope: cold-invocation performance is a property of the whole dependency chain, not just the inference engine** — Sajal Labs' native pipeline sidesteps this entire class of problem by construction (there's no separate "pick the right preprocessing library" decision to get right or wrong), while a Python deployment's actual cold-start number depends on library choices that have nothing to do with model architecture or inference framework.
 
 ## Caveats
 

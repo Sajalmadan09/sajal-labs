@@ -58,16 +58,22 @@ independent implementations (not a bug; see the repo's `research/papers.md`).
 ## Benchmark (single request, Apple M4 CPU — full data in `benchmark_results.json`)
 
 True end-to-end cold invocation (process spawn → raw text in → prediction out
-→ process exit, external wall-clock):
+→ process exit, external wall-clock). **Primary comparison: native vs. ONNX
+Runtime paired with the lean, standalone `tokenizers` library — the
+best-case Python deployment, not the easiest target to beat:**
 
 | Implementation | Cold invocation p50 |
 |---|---:|
 | **Native C++ (Sajal runtime)** | 11.37ms |
-| ONNX Runtime + lean tokenizer | 95.72ms (8.4x slower) |
+| **ONNX Runtime + lean tokenizer** | **95.72ms (8.4x slower)** |
 | ONNX Runtime + 🤗 transformers tokenizer | 2495.61ms (219.6x slower) |
 | PyTorch + 🤗 transformers | 4973.91ms (437.6x slower) |
 
-Worth knowing before you read too much into "ONNX Runtime": its own cold-start
+The last two rows are real and worth knowing, but they're the easy targets
+(heavier Python stacks) — the 8.4x number above is
+the one that holds up against someone who already optimized their Python
+deployment correctly. Worth knowing before you read too much into "ONNX
+Runtime" as a single number: its own cold-start
 number depends heavily on which tokenizer library it's paired with — using
 `transformers` for convenience costs ~25x more than using the lean, standalone
 `tokenizers` library for the exact same token IDs. Native sidesteps that
