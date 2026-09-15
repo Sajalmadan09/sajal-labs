@@ -1,0 +1,20 @@
+{
+  "base_model": "prajjwal1/bert-tiny",
+  "base_model_license": "MIT",
+  "architecture": "bert",
+  "num_hidden_layers": 2,
+  "hidden_size": 128,
+  "num_attention_heads": 2,
+  "intermediate_size": 512,
+  "vocab_size": 30522,
+  "max_position_embeddings": 512,
+  "layer_norm_eps": 1e-12,
+  "num_parameters": 4385920,
+  "precision": "fp32",
+  "original_framework": "pytorch",
+  "sajal_runtime_compatible": true,
+  "sajal_native_port": {
+    "encoder": "native/bert_model.hpp",
+    "tokenizer": "native/wordpiece.hpp (real WordPiece, ASCII-scoped)"
+  }
+}

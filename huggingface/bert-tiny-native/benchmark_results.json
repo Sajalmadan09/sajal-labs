@@ -1,0 +1,28 @@
+{
+  "hardware": "Apple M4, 10 cores, 16GB RAM, macOS (see research/environment.md)",
+  "methodology": "research/experiments/exp11-real-pretrained-transformer/results.md, exp12-warm-latency-width-depth/results.md, exp13-width-threshold/results.md, exp14-wordpiece-native/results.md",
+  "equivalence_native_vs_pytorch": {
+    "note": "native encoder + tokenizer vs. HF BertModel + BertTokenizerFast, 10 real sentences (lengths 4-25 tokens)",
+    "hidden_state_max_abs_error": 9.5367431640625e-06,
+    "pooled_output_max_abs_error": 2.1904706954956055e-06,
+    "mean_cosine_similarity_pooled": 1.000000035762787
+  },
+  "tokenizer_equivalence": "17/17 test sentences (incl. contractions, hyphens, OOV words, emails) produced byte-identical token IDs to HF's real tokenizer \u2014 see exp14",
+  "cold_invocation_ms_p50_precomputed_tokens": {
+    "native": 8.747625000069092,
+    "onnx_runtime_cpu": 87.30802099944412,
+    "pytorch_plus_transformers": 5095.878874999471
+  },
+  "cold_invocation_ms_p50_raw_text_full_pipeline": {
+    "native": 11.36558350026462,
+    "onnx_runtime_cpu_plus_lean_tokenizer": 95.72114549973776,
+    "onnx_runtime_cpu_plus_transformers_tokenizer": 2495.6148125002073,
+    "pytorch_plus_transformers": 4973.907166500794
+  },
+  "warm_loop_ms_p50": {
+    "native": 0.11565,
+    "onnx_runtime_cpu": 0.1342290006505209,
+    "pytorch_eager": 0.27608300115389284
+  },
+  "warm_loop_note": "Unlike cold invocation, native's warm-loop edge is NOT unconditional \u2014 it depends on model width; see exp12/exp13. At this model's hidden_size=128 it's below the measured ~250 crossover, so native keeps a real edge."
+}
