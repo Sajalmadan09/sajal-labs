@@ -14,22 +14,11 @@ in-process loop exp1-6 measured. Each trial is a genuinely fresh OS process
 """
 import json
 import pathlib
-import time
 
-from bench_common import percentiles, dir_size_mb
+from bench_common import percentiles, dir_size_mb, time_invocation
 
 ROOT = pathlib.Path(__file__).parent.parent
 TRIALS = 30
-
-
-def time_invocation(cmd, cwd):
-    import subprocess
-    t0 = time.perf_counter()
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    wall_ms = (time.perf_counter() - t0) * 1000.0
-    if proc.returncode != 0:
-        raise RuntimeError(f"{cmd} failed:\n{proc.stdout}\n{proc.stderr}")
-    return wall_ms
 
 
 def main():

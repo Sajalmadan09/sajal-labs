@@ -48,3 +48,15 @@ def run_timed(cmd, cwd=None):
 
 def dir_size_mb(path):
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6
+
+
+def time_invocation(cmd, cwd=None):
+    """Wall-clock time for one whole subprocess (exp7's cold-invocation
+    metric): process spawn to exit, timed from outside, not the process's
+    own internal clock."""
+    t0 = time.perf_counter()
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    wall_ms = (time.perf_counter() - t0) * 1000.0
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cmd} failed:\n{proc.stdout}\n{proc.stderr}")
+    return wall_ms
