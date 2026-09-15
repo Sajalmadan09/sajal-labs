@@ -57,6 +57,7 @@ Model "kind" (`mlp`, `transformer`, or `text-mlp`) is detected from what's alrea
 8. [Cold invocation sweep](research/experiments/exp8-cold-invocation-sweep/results.md) — pivot confirmed across all 6 sizes
 9. [Gender classifier](research/experiments/exp9-gender-classifier/results.md) — real trained model on real data, pivot holds
 10. [End-to-end native pipeline](research/experiments/exp10-e2e-native-pipeline/results.md) — feature extraction ported to C++, raw string in / prediction out, zero Python
+11. [Real pretrained transformer](research/experiments/exp11-real-pretrained-transformer/results.md) — prajjwal1/bert-tiny (4.4M real params), fp32-tight equivalence on 10 real sentences, 582x cold-invocation win over PyTorch+transformers
 
 ## Roadmap
 
@@ -68,6 +69,6 @@ Model "kind" (`mlp`, `transformer`, or `text-mlp`) is detected from what's alrea
 5. Packaging — done (safetensors + ONNX + native formats, machine-readable benchmark data)
 6. Developer experience (CLI) — done ([native/sajal.cpp](native/sajal.cpp): `inspect`/`run`/`bench`, in-process dispatch across model kinds)
 7. Hugging Face integration — done ([sajalmadan09/indian-name-gender-classifier](https://huggingface.co/sajalmadan09/indian-name-gender-classifier), published)
-8. Transformer support — architecture proven (exp2-8); real pretrained transformer not yet tried (exp9 used the MLP architecture)
+8. Transformer support — done (exp11: real pretrained BERT, [native/bert_model.hpp](native/bert_model.hpp), fp32-tight equivalence on 10 real sentences)
 9. Hardware optimization (SIMD/CUDA) — Apple Accelerate/AMX only so far; no CUDA hardware available
 10. Research publication

@@ -7,3 +7,4 @@ native/transformer
 native/gemm_bench
 native/gender_predict
 native/sajal
+native/bert
