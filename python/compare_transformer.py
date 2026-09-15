@@ -1,13 +1,17 @@
 """Same equivalence methodology as compare.py (see its docstring), adapted
 for the transformer block's [n_test, seq_len, d_model] output shape. No
 'prediction' to agree on here (this block isn't a classifier), so per-element
-error stats are the primary signal, plus per-token cosine similarity."""
+error stats are the primary signal, plus per-token cosine similarity.
+Takes the artifacts dir as an optional arg so exp3's sweep can reuse it."""
 import json
 import pathlib
+import sys
 
 import numpy as np
 
-ARTIFACTS = pathlib.Path(__file__).parent.parent / "artifacts" / "transformer"
+ARTIFACTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    pathlib.Path(__file__).parent.parent / "artifacts" / "transformer"
+)
 
 
 def main():
@@ -39,9 +43,8 @@ def main():
         "rmse": rmse,
         "mean_cosine_similarity_per_token": cos_sim,
         "tolerance_note": (
-            "6 matmuls + softmax + 2 LayerNorms + GELU, fp32, ~2700x more MACs than exp1's MLP — "
-            "expect larger accumulated error than exp1, still fp32-scale, not a bug. "
-            "See research/papers.md sections 8-9."
+            "6 matmuls + softmax + 2 LayerNorms + GELU, fp32 — some accumulated error vs. a "
+            "single-matmul model is expected, not a bug. See research/papers.md sections 8-9."
         ),
     }
 
@@ -49,9 +52,9 @@ def main():
     (ARTIFACTS / "equivalence_result.json").write_text(json.dumps(result, indent=2))
 
     if max_abs_err > 1e-2:
-        print(f"\nNOTE: max_abs_error {max_abs_err:.2e} is notably larger than exp1's ~1e-8 — "
-              f"worth checking whether it's proportional to the extra matmul/LayerNorm depth "
-              f"or signals an actual bug (e.g. a LayerNorm eps or GELU formula mismatch).")
+        print(f"\nNOTE: max_abs_error {max_abs_err:.2e} is notably larger than expected for fp32 — "
+              f"worth checking whether it's proportional to model depth/size or signals an actual "
+              f"bug (e.g. a LayerNorm eps or GELU formula mismatch).")
 
 
 if __name__ == "__main__":

@@ -1,23 +1,28 @@
 import json
 import pathlib
+import sys
 import time
 
 t_start = time.perf_counter()
 
 import torch  # noqa: E402
 
-from tiny_transformer import TinyTransformerBlock, SEQ_LEN, D_MODEL  # noqa: E402
+from tiny_transformer import TinyTransformerBlock  # noqa: E402
 from bench_common import time_calls, percentiles  # noqa: E402
 
-ARTIFACTS = pathlib.Path(__file__).parent.parent / "artifacts" / "transformer"
+ARTIFACTS = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    pathlib.Path(__file__).parent.parent / "artifacts" / "transformer"
+)
 
 torch.set_num_threads(1)  # match the C++ side: single-threaded, batch size 1
 
-model = TinyTransformerBlock()
+seq_len, d_model, n_heads, d_ff, _n_test = map(int, (ARTIFACTS / "shapes.txt").read_text().split())
+
+model = TinyTransformerBlock(seq_len, d_model, n_heads, d_ff)
 model.load_state_dict(torch.load(ARTIFACTS / "model_state_dict.pt", weights_only=True))
 model.eval()
 
-x = torch.full((SEQ_LEN, D_MODEL), 0.1)
+x = torch.full((seq_len, d_model), 0.1)
 
 cold_start_ms = (time.perf_counter() - t_start) * 1000.0
 

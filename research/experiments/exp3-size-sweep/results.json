@@ -1,0 +1,79 @@
+{
+  "experiment": "exp3-size-sweep",
+  "seq_len": 32,
+  "n_heads": 4,
+  "rows": [
+    {
+      "d_model": 16,
+      "d_ff": 64,
+      "macs": 131072,
+      "max_abs_error": 7.152557373046875e-07,
+      "native_p50_ms": 0.02329,
+      "native_peak_rss_mb": 5.881856,
+      "pytorch_p50_ms": 0.06274999941524584,
+      "onnx_p50_ms": 0.023874999897088856,
+      "native_vs_pytorch": 2.6942893694824317,
+      "native_vs_onnx": 1.0251180720089674
+    },
+    {
+      "d_model": 32,
+      "d_ff": 128,
+      "macs": 458752,
+      "max_abs_error": 7.152557373046875e-07,
+      "native_p50_ms": 0.03071,
+      "native_peak_rss_mb": 5.996544,
+      "pytorch_p50_ms": 0.07283349987119436,
+      "onnx_p50_ms": 0.03393750012037344,
+      "native_vs_pytorch": 2.3716541801105295,
+      "native_vs_onnx": 1.1050960638350193
+    },
+    {
+      "d_model": 64,
+      "d_ff": 256,
+      "macs": 1703936,
+      "max_abs_error": 9.5367431640625e-07,
+      "native_p50_ms": 0.05573,
+      "native_peak_rss_mb": 6.242304,
+      "pytorch_p50_ms": 0.08562499988329364,
+      "onnx_p50_ms": 0.05074999990029028,
+      "native_vs_pytorch": 1.536425621447939,
+      "native_vs_onnx": 0.9106405867627898
+    },
+    {
+      "d_model": 128,
+      "d_ff": 512,
+      "macs": 6553600,
+      "max_abs_error": 1.1920928955078125e-06,
+      "native_p50_ms": 0.09721,
+      "native_peak_rss_mb": 7.077888,
+      "pytorch_p50_ms": 0.10225000005448237,
+      "onnx_p50_ms": 0.08904200012693764,
+      "native_vs_pytorch": 1.0518465184084185,
+      "native_vs_onnx": 0.9159757239680859
+    },
+    {
+      "d_model": 192,
+      "d_ff": 768,
+      "macs": 14548992,
+      "max_abs_error": 1.430511474609375e-06,
+      "native_p50_ms": 0.148,
+      "native_peak_rss_mb": 8.568832,
+      "pytorch_p50_ms": 0.18131200022253324,
+      "onnx_p50_ms": 0.13154200041753938,
+      "native_vs_pytorch": 1.225081082584684,
+      "native_vs_onnx": 0.8887973001185094
+    },
+    {
+      "d_model": 256,
+      "d_ff": 1024,
+      "macs": 25690112,
+      "max_abs_error": 1.6689300537109375e-06,
+      "native_p50_ms": 0.20938,
+      "native_peak_rss_mb": 11.026432,
+      "pytorch_p50_ms": 0.23366699952021008,
+      "onnx_p50_ms": 0.17854199995781528,
+      "native_vs_pytorch": 1.1159948396227437,
+      "native_vs_onnx": 0.8527175468421782
+    }
+  ]
+}
