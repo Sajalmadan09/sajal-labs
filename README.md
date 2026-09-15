@@ -58,6 +58,7 @@ Model "kind" (`mlp`, `transformer`, or `text-mlp`) is detected from what's alrea
 9. [Gender classifier](research/experiments/exp9-gender-classifier/results.md) — real trained model on real data, pivot holds
 10. [End-to-end native pipeline](research/experiments/exp10-e2e-native-pipeline/results.md) — feature extraction ported to C++, raw string in / prediction out, zero Python
 11. [Real pretrained transformer](research/experiments/exp11-real-pretrained-transformer/results.md) — prajjwal1/bert-tiny (4.4M real params), fp32-tight equivalence on 10 real sentences, 582x cold-invocation win over PyTorch+transformers
+12. [Width vs. depth ablation](research/experiments/exp12-warm-latency-width-depth/results.md) — resolves exp11's warm-latency nuance: width (hidden_size) drives whether native retains an edge, not depth or toolchain
 
 ## Roadmap
 

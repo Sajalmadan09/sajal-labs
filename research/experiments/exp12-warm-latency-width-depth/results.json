@@ -1,0 +1,38 @@
+{
+  "experiment": "exp12-width-depth-sweep",
+  "seq_len": 12,
+  "rows": [
+    {
+      "hidden": 128,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.05279,
+      "onnx_p50_ms": 0.07412499871861655,
+      "native_vs_onnx": 1.4041484887027194
+    },
+    {
+      "hidden": 128,
+      "num_layers": 2,
+      "head_dim": 64,
+      "native_p50_ms": 0.10671,
+      "onnx_p50_ms": 0.12281250019441359,
+      "native_vs_onnx": 1.150899636345362
+    },
+    {
+      "hidden": 256,
+      "num_layers": 1,
+      "head_dim": 64,
+      "native_p50_ms": 0.13333,
+      "onnx_p50_ms": 0.1320410001426353,
+      "native_vs_onnx": 0.9903322593762492
+    },
+    {
+      "hidden": 256,
+      "num_layers": 2,
+      "head_dim": 64,
+      "native_p50_ms": 0.28771,
+      "onnx_p50_ms": 0.2521045007597422,
+      "native_vs_onnx": 0.876245180076265
+    }
+  ]
+}
