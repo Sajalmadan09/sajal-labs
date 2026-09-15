@@ -31,6 +31,7 @@ not sustained high-throughput serving.
 ## Published models
 
 - [sajalmadan09/indian-name-gender-classifier](https://huggingface.co/sajalmadan09/indian-name-gender-classifier) — exp9/10's real gender classifier, weights in native/safetensors/ONNX formats, model card with honest accuracy/limitations/benchmark data. Local package source: [huggingface/gender-classifier/](huggingface/gender-classifier/) ([python/export_hf_package.py](python/export_hf_package.py) regenerates it from the experiment data).
+- [sajalmadan09/bert-tiny-native-cpp](https://huggingface.co/sajalmadan09/bert-tiny-native-cpp) — native C++ port of [prajjwal1/bert-tiny](https://huggingface.co/prajjwal1/bert-tiny) (a third-party MIT-licensed model, clearly credited as `base_model` — not ours, the port is). Exact-match tokenizer, fp32-tight encoder equivalence, full exp11-14 benchmark data. Local package source: [huggingface/bert-tiny-native/](huggingface/bert-tiny-native/) ([python/export_bert_hf_package.py](python/export_bert_hf_package.py)).
 
 ## CLI
 
