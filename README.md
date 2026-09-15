@@ -28,6 +28,10 @@ ONNX Runtime CPU for any transformer-shaped model tested. Target use case:
 serverless functions, CLI tools, intermittently-invoked edge devices —
 not sustained high-throughput serving.
 
+## Published models
+
+- [sajalmadan09/indian-name-gender-classifier](https://huggingface.co/sajalmadan09/indian-name-gender-classifier) — exp9/10's real gender classifier, weights in native/safetensors/ONNX formats, model card with honest accuracy/limitations/benchmark data. Local package source: [huggingface/gender-classifier/](huggingface/gender-classifier/) ([python/export_hf_package.py](python/export_hf_package.py) regenerates it from the experiment data).
+
 ## CLI
 
 ```bash
@@ -61,9 +65,9 @@ Model "kind" (`mlp`, `transformer`, or `text-mlp`) is detected from what's alrea
 2. Native runtime core (Tensor, Linear, ReLU, Softmax, LayerNorm, GELU) — done ([native/common.hpp](native/common.hpp))
 3. Model equivalence (real trained model) — done (exp9: real Indian-name gender classifier, 100% prediction agreement)
 4. Benchmarking vs. strong baselines — done, revised toward cold-invocation
-5. Packaging
+5. Packaging — done (safetensors + ONNX + native formats, machine-readable benchmark data)
 6. Developer experience (CLI) — done ([native/sajal.cpp](native/sajal.cpp): `inspect`/`run`/`bench`, in-process dispatch across model kinds)
-7. Hugging Face integration
+7. Hugging Face integration — done ([sajalmadan09/indian-name-gender-classifier](https://huggingface.co/sajalmadan09/indian-name-gender-classifier), published)
 8. Transformer support — architecture proven (exp2-8); real pretrained transformer not yet tried (exp9 used the MLP architecture)
 9. Hardware optimization (SIMD/CUDA) — Apple Accelerate/AMX only so far; no CUDA hardware available
 10. Research publication
