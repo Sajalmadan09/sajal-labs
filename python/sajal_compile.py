@@ -1,4 +1,4 @@
-"""exp15-20: the smallest real ONNX -> native C++ compiler.
+"""exp15-22: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -24,6 +24,17 @@ via CblasTrans on K, no physical transpose; multi-head loops that per two
 cblas_sgemm calls over head-sized column slices (pointer offset + full-row
 stride, no physical splitting either). Not new numerical code — the same
 validated pattern, now reachable from a compiled ONNX graph.
+
+exp22: benchmarked the compiler against exp2's own hand-written baseline
+(same architecture, weights, methodology) rather than only checking
+correctness. Found a real gap by testing against exp2's actual model
+instead of only synthetic test models: its attention scaling uses a `Div`
+node (`x / sqrt(d)`), where every synthetic test model up to this point
+happened to use `Mul` (`x * scale`) — mathematically identical, different
+ONNX op. try_match_scale() now accepts either. Also added a `bench` mode
+to generated code (matching transformer.cpp's methodology exactly) and
+fixed `once_mode` to use the full sequence length for attention-containing
+models rather than a hardcoded single row.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -52,6 +63,25 @@ def cpp_id(name):
     return "".join(c if c.isalnum() else "_" for c in name)
 
 
+def try_match_scale(node, scores_tensor, constants):
+    """Matches either `Mul(scores, c)` (scale by c) or `Div(scores, c)`
+    (scale by 1/c) — mathematically the same "scale the attention scores"
+    step, but two different ONNX ops depending on whether the exporting
+    code wrote `x * (1/sqrt(d))` or `x / sqrt(d)`. exp2's own
+    TinyTransformerBlock uses the latter; every synthetic compiler test
+    model so far used the former — this one match covers both rather than
+    requiring test models to happen to match the exact op a real model
+    uses. Returns (scale_value, output_tensor) or None."""
+    if node.op_type not in ("Mul", "Div") or scores_tensor not in node.input:
+        return None
+    candidates = [x for x in node.input if x != scores_tensor]
+    if len(candidates) != 1 or candidates[0] not in constants:
+        return None
+    c = float(np.asarray(constants[candidates[0]]).reshape(-1)[0])
+    scale_value = c if node.op_type == "Mul" else 1.0 / c
+    return scale_value, node.output[0]
+
+
 def try_match_self_attention(nodes, i, constants, tensor_dims):
     """Looks for exactly: Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul(scale)
     -> Softmax -> MatMul(attn,V), starting at nodes[i]. Returns
@@ -77,13 +107,10 @@ def try_match_self_attention(nodes, i, constants, tensor_dims):
         return None
     q_tensor, scores_tensor = others[0], n1.output[0]
 
-    if n2.op_type != "Mul" or scores_tensor not in n2.input:
+    scale_match = try_match_scale(n2, scores_tensor, constants)
+    if scale_match is None:
         return None
-    scale_candidates = [x for x in n2.input if x != scores_tensor]
-    if len(scale_candidates) != 1 or scale_candidates[0] not in constants:
-        return None
-    scale_value = float(np.asarray(constants[scale_candidates[0]]).reshape(-1)[0])
-    scaled_tensor = n2.output[0]
+    scale_value, scaled_tensor = scale_match
 
     if n3.op_type != "Softmax" or list(n3.input) != [scaled_tensor]:
         return None
@@ -191,16 +218,16 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         return None
     v_branch = next(b for b in qv_branches if b is not q_branch)
 
-    mul_matches = find_consumers(mm_pre_node.output[0], "Mul")
-    if len(mul_matches) != 1:
+    scale_matches = find_consumers(mm_pre_node.output[0], "Mul") + find_consumers(mm_pre_node.output[0], "Div")
+    if len(scale_matches) != 1:
         return None
-    mul_idx, mul_node = mul_matches[0]
-    scale_candidates = [x for x in mul_node.input if x != mm_pre_node.output[0]]
-    if len(scale_candidates) != 1 or scale_candidates[0] not in constants:
+    mul_idx, mul_node = scale_matches[0]
+    scale_match = try_match_scale(mul_node, mm_pre_node.output[0], constants)
+    if scale_match is None:
         return None
-    scale_value = float(np.asarray(constants[scale_candidates[0]]).reshape(-1)[0])
+    scale_value, scaled_tensor = scale_match
 
-    softmax_matches = find_consumers(mul_node.output[0], "Softmax")
+    softmax_matches = find_consumers(scaled_tensor, "Softmax")
     if len(softmax_matches) != 1:
         return None
     softmax_idx, softmax_node = softmax_matches[0]
@@ -453,9 +480,24 @@ def generate_cpp(ir, graph_input_name):
 
     body = "\n".join(forward_lines)
 
+    # Attention-containing models mix information across all n rows of one
+    # call (one sequence, not n independent examples — see
+    # export_attention_test.py's docstring), so "one inference" for
+    # bench/once means the full sequence length, read from test_config.txt
+    # at runtime same as run_mode already does. Non-attention models keep
+    # n=1 (one independent example), matching mlp.cpp/gender_predict.cpp's
+    # own bench/once convention exactly, unchanged from exp15.
+    has_attention = any(op["op"] in ("self_attention", "multihead_self_attention") for op in ir)
+    if has_attention:
+        read_n = '    std::ifstream cfg(dir + "/test_config.txt");\n    int in_dim, n;\n    cfg >> in_dim >> n;'
+    else:
+        read_n = "    int n = 1;"
+
     return f"""\
 // AUTO-GENERATED by python/sajal_compile.py — do not hand-edit.
 // Generated from an ONNX graph (DAG): {', '.join(f"{op['op']}->{cpp_id(op['output'])}" for op in ir)}.
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -490,17 +532,53 @@ void run_mode(const std::string& dir) {{
     std::cerr << "wrote native_outputs.bin (" << n_test << "x" << CompiledModel::OUTPUT_DIM << ")\\n";
 }}
 
+// Same methodology as native/transformer.cpp's bench_mode: cold_start_ms
+// times load_model() alone, then 50 warmup + 500 measured warm-loop calls,
+// same percentile() helper (common.hpp), same JSON print shape.
+void bench_mode(const std::string& dir) {{
+    auto t_start = Clock::now();
+    CompiledModel m = load_model(dir);
+    auto cold_start_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
+
+{read_n}
+    std::vector<float> x(static_cast<size_t>(n) * CompiledModel::INPUT_DIM, 0.1f);
+
+    const int WARMUP = 50, ITERS = 500;
+    for (int i = 0; i < WARMUP; ++i) m.forward(x, n);
+
+    std::vector<double> latencies_ms;
+    latencies_ms.reserve(ITERS);
+    for (int i = 0; i < ITERS; ++i) {{
+        auto t0 = Clock::now();
+        auto y = m.forward(x, n);
+        latencies_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        asm volatile("" : : "g"(y.data()) : "memory");
+    }}
+
+    double mean = 0;
+    for (double v : latencies_ms) mean += v;
+    mean /= latencies_ms.size();
+
+    std::printf(
+        "{{\\"impl\\": \\"compiled_cpp\\", \\"cold_start_ms\\": %.4f, \\"warmup_iters\\": %d, \\"iters\\": %d, "
+        "\\"mean_ms\\": %.5f, \\"p50_ms\\": %.5f, \\"p90_ms\\": %.5f, \\"p95_ms\\": %.5f, \\"p99_ms\\": %.5f}}\\n",
+        cold_start_ms, WARMUP, ITERS, mean, percentile(latencies_ms, 50), percentile(latencies_ms, 90),
+        percentile(latencies_ms, 95), percentile(latencies_ms, 99));
+}}
+
 void once_mode(const std::string& dir) {{
     CompiledModel m = load_model(dir);
-    std::vector<float> x(CompiledModel::INPUT_DIM, 0.1f);
-    auto y = m.forward(x, 1);
+{read_n}
+    std::vector<float> x(static_cast<size_t>(n) * CompiledModel::INPUT_DIM, 0.1f);
+    auto y = m.forward(x, n);
     asm volatile("" : : "g"(y.data()) : "memory");
 }}
 
 int main(int argc, char** argv) {{
-    if (argc != 3) {{ std::cerr << "usage: " << argv[0] << " <dir> <run|once>\\n"; return 1; }}
+    if (argc != 3) {{ std::cerr << "usage: " << argv[0] << " <dir> <run|bench|once>\\n"; return 1; }}
     std::string dir = argv[1], mode = argv[2];
     if (mode == "run") run_mode(dir);
+    else if (mode == "bench") bench_mode(dir);
     else if (mode == "once") once_mode(dir);
     else {{ std::cerr << "unknown mode\\n"; return 1; }}
     return 0;

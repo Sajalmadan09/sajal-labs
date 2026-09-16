@@ -1,0 +1,28 @@
+{
+  "experiment": "exp22-compiler-vs-handwritten-baseline",
+  "trials": 30,
+  "results": [
+    {
+      "impl": "handwritten_transformer",
+      "trials": 30,
+      "mean_ms": 4.777106933033792,
+      "p50_ms": 4.6099169994704425,
+      "p90_ms": 5.349546099751024,
+      "p95_ms": 5.6420455002808,
+      "p99_ms": 5.776251569004671
+    },
+    {
+      "impl": "compiled_transformer",
+      "trials": 30,
+      "mean_ms": 4.764347200277068,
+      "p50_ms": 4.625770499842474,
+      "p90_ms": 5.245041300804588,
+      "p95_ms": 5.653755949788319,
+      "p99_ms": 5.815711430986994
+    }
+  ],
+  "footprint": {
+    "handwritten_transformer_binary_mb": 0.058792,
+    "compiled_transformer_binary_mb": 0.05796
+  }
+}
