@@ -1,29 +1,26 @@
-"""exp15/16/17: the smallest real ONNX -> native C++ compiler.
+"""exp15-18: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
-exp16: generalized to arbitrary sequential chains of 5 ops (added LayerNorm/
-GELU), still a flat IR where each op implicitly consumes "whatever the
-previous op produced".
-exp17 (this version): the IR became a real DAG. Each op now records its
-ACTUAL named input tensor(s) and output tensor name, resolved from the ONNX
-graph directly — not "the previous op's output". This is what residual
-connections (y = LayerNorm(x + sublayer(x))) and, eventually, attention's
-Q/K/V branching actually need: a tensor gets consumed more than once,
-non-adjacently, which a flat chain has no way to represent.
+exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
+exp17: the IR became a real DAG (named tensors, not "previous op's output"),
+added Add for residual connections.
+exp18 (this version): single-head self-attention. NOT general MatMul/
+Transpose support — this compiler recognizes exactly one 5-node pattern
+(Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul(scale) -> Softmax -> MatMul(V))
+as a single fused "self_attention" IR op, and rejects anything that doesn't
+match this exact shape. That's a deliberate, narrower claim than "supports
+attention" — multi-head (reshape/transpose per head) is a separate, larger
+step, not attempted here (see exp18's results.md).
 
-Added op: Add (elementwise, exactly 2 non-initializer tensor inputs — a
-residual connection, not a bias-add, which our Gemm nodes already fold in).
+Codegen for the fused op reuses the exact BLAS trick already validated in
+native/transformer_model.hpp and native/bert_model.hpp: Q@K^T is one
+cblas_sgemm call with CblasTrans on K (no physical transpose, no separate
+IR/codegen handling for the Transpose node — it's consumed entirely inside
+the fusion), scaled attention @ V is a second cblas_sgemm call. This is not
+new numerical code, it's the same validated pattern, now reachable from a
+compiled ONNX graph instead of only from hand-written headers.
 
-Codegen changed accordingly: instead of threading one "cur" buffer through
-generated code, it declares one std::vector<float> per unique ONNX tensor
-name that gets produced, and each op reads its named input variable(s) and
-writes its named output variable — a real (if still restricted: no control
-flow, no loops, fixed shapes) dataflow graph in C++, not just a chain.
-
-Still narrow, stated explicitly: no attention yet (Q/K/V branching from one
-input needs the same DAG machinery this experiment adds, but attention's
-per-head reshape/transpose/batched-matmul is a different, larger step, not
-attempted here). No opset<20 decomposed-GELU pattern-matching. No dynamic
-shapes or control flow (If/Loop/Scan).
+Everything else (op-to-function mapping, DAG-based tensor tracking, weight
+extraction convention) is unchanged from exp17 — see its docstring.
 """
 import pathlib
 import shutil
@@ -49,6 +46,61 @@ def cpp_id(name):
     return "".join(c if c.isalnum() else "_" for c in name)
 
 
+def try_match_self_attention(nodes, i, constants, tensor_dims):
+    """Looks for exactly: Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul(scale)
+    -> Softmax -> MatMul(attn,V), starting at nodes[i]. Returns
+    (ir_entry, next_index) or None — a pattern match, not general MatMul/
+    Transpose support; anything not shaped exactly like this falls through
+    to the caller's normal per-node handling (which will reject Transpose/
+    MatMul as unsupported op types on their own)."""
+    if i + 4 >= len(nodes):
+        return None
+    n0, n1, n2, n3, n4 = nodes[i:i + 5]
+
+    if n0.op_type != "Transpose":
+        return None
+    perm = next((list(onnx.helper.get_attribute_value(a)) for a in n0.attribute if a.name == "perm"), None)
+    if perm != [1, 0]:
+        return None
+    k_tensor, kt_tensor = n0.input[0], n0.output[0]
+
+    if n1.op_type != "MatMul" or kt_tensor not in n1.input:
+        return None
+    others = [x for x in n1.input if x != kt_tensor]
+    if len(others) != 1:
+        return None
+    q_tensor, scores_tensor = others[0], n1.output[0]
+
+    if n2.op_type != "Mul" or scores_tensor not in n2.input:
+        return None
+    scale_candidates = [x for x in n2.input if x != scores_tensor]
+    if len(scale_candidates) != 1 or scale_candidates[0] not in constants:
+        return None
+    scale_value = float(np.asarray(constants[scale_candidates[0]]).reshape(-1)[0])
+    scaled_tensor = n2.output[0]
+
+    if n3.op_type != "Softmax" or list(n3.input) != [scaled_tensor]:
+        return None
+    attn_tensor = n3.output[0]
+
+    if n4.op_type != "MatMul" or attn_tensor not in n4.input:
+        return None
+    v_candidates = [x for x in n4.input if x != attn_tensor]
+    if len(v_candidates) != 1:
+        return None
+    v_tensor = v_candidates[0]
+
+    if q_tensor not in tensor_dims or k_tensor not in tensor_dims or v_tensor not in tensor_dims:
+        return None
+    d = tensor_dims[q_tensor]
+    if tensor_dims[k_tensor] != d or tensor_dims[v_tensor] != d:
+        return None
+
+    ir_entry = {"op": "self_attention", "q": q_tensor, "k": k_tensor, "v": v_tensor,
+                "scale": scale_value, "output": n4.output[0], "dim": d}
+    return ir_entry, i + 5
+
+
 def parse_onnx(onnx_path):
     model = onnx.load(str(onnx_path))
     graph = model.graph
@@ -56,19 +108,40 @@ def parse_onnx(onnx_path):
     initializer_names = set(initializers.keys())
     graph_input_name = graph.input[0].name
 
-    ir = []
-    tensor_dims = {}  # ONNX tensor name -> channel dim, filled in as we discover it
-
+    # Constant nodes (e.g. the attention scale factor) are pre-resolved to
+    # values and skipped in the main walk — they carry no runtime input.
+    constants = {}
+    nodes = []
     for node in graph.node:
+        if node.op_type == "Constant":
+            val_attr = next(a for a in node.attribute if a.name == "value")
+            constants[node.output[0]] = numpy_helper.to_array(onnx.helper.get_attribute_value(val_attr))
+        else:
+            nodes.append(node)
+
+    ir = []
+    tensor_dims = {}
+    i = 0
+    while i < len(nodes):
+        node = nodes[i]
+
+        match = try_match_self_attention(nodes, i, constants, tensor_dims)
+        if match is not None:
+            ir_entry, next_i = match
+            tensor_dims[ir_entry["output"]] = ir_entry["dim"]
+            ir.append(ir_entry)
+            i = next_i
+            continue
+
         if node.op_type not in SUPPORTED_OPS:
             raise UnsupportedGraph(
-                f"op '{node.op_type}' is not supported by this compiler "
-                f"(supported: {sorted(SUPPORTED_OPS)})"
+                f"op '{node.op_type}' is not supported by this compiler outside the recognized "
+                f"self-attention pattern (supported standalone: {sorted(SUPPORTED_OPS)})"
             )
         if len(node.output) != 1:
             raise UnsupportedGraph(f"op '{node.op_type}' has multiple outputs, not supported")
 
-        non_init_inputs = [i for i in node.input if i not in initializer_names]
+        non_init_inputs = [x for x in node.input if x not in initializer_names]
         out_name = node.output[0]
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
 
@@ -80,7 +153,7 @@ def parse_onnx(onnx_path):
             in_tensor = non_init_inputs[0]
             _, w_name, b_name = node.input
             out_dim, in_dim = initializers[w_name].shape
-            tensor_dims[in_tensor] = int(in_dim)  # learned retroactively from the weight shape
+            tensor_dims[in_tensor] = int(in_dim)
             tensor_dims[out_name] = int(out_dim)
             ir.append({"op": "linear", "output": out_name, "input": in_tensor,
                        "weight": w_name, "bias": b_name, "in_dim": int(in_dim), "out_dim": int(out_dim)})
@@ -127,6 +200,8 @@ def parse_onnx(onnx_path):
             tensor_dims[out_name] = tensor_dims[a]
             ir.append({"op": "add", "output": out_name, "inputs": [a, b], "dim": tensor_dims[a]})
 
+        i += 1
+
     if not ir or ir[0]["op"] != "linear":
         raise UnsupportedGraph("this compiler requires the graph to start with a Linear (Gemm) layer")
 
@@ -135,15 +210,15 @@ def parse_onnx(onnx_path):
 
 def generate_cpp(ir, graph_input_name):
     """One block of C++ per IR op, reading/writing named variables that
-    correspond directly to ONNX tensor names — a real dataflow graph, not a
-    single threaded-through buffer. Declares one std::vector<float> per
-    unique tensor produced; the graph's own input tensor maps to the
-    function parameter X directly, no separate copy."""
+    correspond directly to ONNX tensor names."""
 
     def var(tensor_name):
         return "X" if tensor_name == graph_input_name else cpp_id(tensor_name)
 
     input_dim = ir[0]["in_dim"]
+    # Last Linear's out_dim — correct for every model tested so far (all end in a
+    # projection). A model ending directly in attention/LayerNorm with no trailing
+    # Linear would need this generalized; not attempted since no test case needs it yet.
     output_dim = next(op["out_dim"] for op in reversed(ir) if op["op"] == "linear")
     final_output_var = var(ir[-1]["output"])
 
@@ -162,10 +237,10 @@ def generate_cpp(ir, graph_input_name):
         elif op["op"] in ("relu", "gelu", "softmax"):
             in_var = var(op["input"])
             forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
-            fn = {"relu": "relu_inplace", "gelu": "gelu_inplace", "softmax": None}[op["op"]]
             if op["op"] == "softmax":
                 forward_lines.append(f"        softmax_rows({out_var}.data(), n, {op['dim']});")
             else:
+                fn = "relu_inplace" if op["op"] == "relu" else "gelu_inplace"
                 forward_lines.append(f"        {fn}({out_var}.data(), {out_var}.size());")
         elif op["op"] == "layernorm":
             w, b = cpp_id(op["weight"]), cpp_id(op["bias"])
@@ -179,6 +254,23 @@ def generate_cpp(ir, graph_input_name):
             a_var, b_var = var(op["inputs"][0]), var(op["inputs"][1])
             forward_lines.append(f"        std::vector<float> {out_var} = {a_var};")
             forward_lines.append(f"        add_inplace({out_var}.data(), {b_var}.data(), {out_var}.size());")
+        elif op["op"] == "self_attention":
+            q_var, k_var, v_var = var(op["q"]), var(op["k"]), var(op["v"])
+            d, scale = op["dim"], op["scale"]
+            scores_var = out_var + "_scores"
+            # Same BLAS trick as native/transformer_model.hpp and native/bert_model.hpp:
+            # CblasTrans on K computes Q@K^T with no physical transpose.
+            forward_lines.append(f"        std::vector<float> {scores_var}(static_cast<size_t>(n) * n);")
+            forward_lines.append(
+                f"        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, n, {d}, {scale}f, "
+                f"{q_var}.data(), {d}, {k_var}.data(), {d}, 0.0f, {scores_var}.data(), n);"
+            )
+            forward_lines.append(f"        softmax_rows({scores_var}.data(), n, n);")
+            forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {d});")
+            forward_lines.append(
+                f"        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, {d}, n, 1.0f, "
+                f"{scores_var}.data(), n, {v_var}.data(), {d}, 0.0f, {out_var}.data(), {d});"
+            )
 
     body = "\n".join(forward_lines)
 
@@ -259,7 +351,6 @@ def compile_model(onnx_path, source_artifacts_dir, out_dir):
     if (source_artifacts_dir / "test_config.txt").exists():
         shutil.copy(source_artifacts_dir / "test_config.txt", out_dir / "test_config.txt")
     else:
-        # exp1/exp9's older shapes.txt convention: "in_dim hidden_dim out_dim n_test"
         in_dim, _, _, n_test = (source_artifacts_dir / "shapes.txt").read_text().split()
         (out_dir / "test_config.txt").write_text(f"{in_dim} {n_test}\n")
 

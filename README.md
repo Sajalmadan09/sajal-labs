@@ -67,6 +67,7 @@ Model "kind" (`mlp`, `transformer`, `text-mlp`, or `bert`) is detected from what
 15. [Minimal ONNX→C++ compiler](research/experiments/exp15-minimal-compiler/results.md) — the first real compiler, not a hand-port: auto-generated code from exp1/exp9's ONNX graphs is bit-identical to the hand-written reference, `sajal` CLI works on the output with zero modification, fails cleanly on out-of-scope graphs
 16. [LayerNorm + GELU in the compiler](research/experiments/exp16-layernorm-gelu/results.md) — generalized codegen (IR-driven, not a fixed template) to 5 ops; still bit-identical to a hand-written reference; caught and avoided a real correctness trap (reusing exp15's artifact convention would have let `sajal` silently misread the new graph shape)
 17. [DAG support](research/experiments/exp17-dag-support/results.md) — the IR became a real graph (named tensors, not "previous op's output"); compiled a genuine residual connection (`LayerNorm(x + sublayer(x))`, the actual FFN half of a transformer block) bit-identical to a hand-written reference; exercised a validation check exp16 had flagged as unreachable
+18. [Single-head attention](research/experiments/exp18-single-head-attention/results.md) — fused a 5-node ONNX pattern (Transpose→MatMul→Mul→Softmax→MatMul) into one IR op, reusing the exact BLAS trick already validated in transformer_model.hpp/bert_model.hpp; bit-identical to a hand-written reference; correctly rejects a malformed near-attention graph rather than mis-matching it
 
 ## Roadmap
 
@@ -81,4 +82,4 @@ Model "kind" (`mlp`, `transformer`, `text-mlp`, or `bert`) is detected from what
 8. Transformer support — done (exp11: real pretrained BERT, [native/bert_model.hpp](native/bert_model.hpp), fp32-tight equivalence on 10 real sentences)
 9. Hardware optimization (SIMD/CUDA) — Apple Accelerate/AMX only so far; no CUDA hardware available
 10. Research publication
-11. Model compiler (ONNX → native C++, not hand-porting) — in progress (exp15-17: [python/sajal_compile.py](python/sajal_compile.py), 6 ops incl. LayerNorm/GELU/Add, real DAG-based IR, bit-identical to hand-written references incl. a genuine residual connection; attention not yet supported — needs runtime-tensor MatMul + reshape/transpose, a bigger step than the DAG rewrite)
+11. Model compiler (ONNX → native C++, not hand-porting) — in progress (exp15-18: [python/sajal_compile.py](python/sajal_compile.py), DAG-based IR, single-head self-attention fused as a pattern, bit-identical to hand-written references throughout; multi-head reshape/transpose not yet supported)

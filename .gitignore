@@ -10,3 +10,4 @@ native/sajal
 native/bert
 native/lngelu_reference
 native/residual_reference
+native/attention_reference
