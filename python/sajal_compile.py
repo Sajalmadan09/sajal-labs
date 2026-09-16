@@ -1,4 +1,4 @@
-"""exp15-23: the smallest real ONNX -> native C++ compiler.
+"""exp15-24: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -44,9 +44,19 @@ contains more than one (every prior experiment had exactly one, so this
 never showed up). Rewrote try_match_multihead_attention to be purely
 tensor-flow-traced from wherever it starts — see its docstring.
 
+exp24: widened GELU support to the 5-node DECOMPOSED form ONNX exporters
+emit at opset<20 (`Gelu` only became a fused op at opset 20) —
+`0.5*x*(1+erf(x/sqrt(2)))` as `Div->Erf->Add->Mul->Mul`. Unlike multi-head
+attention's Q/K/V split, this pattern has no parallel branches (it's a
+strictly sequential chain), so a positional lookahead (like exp18's
+try_match_self_attention) is safe here — exp23's tensor-flow-tracing
+rewrite was needed specifically because attention's branches interleave
+with other nodes; a linear chain never does.
+
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
 """
+import math
 import pathlib
 import shutil
 import subprocess
@@ -88,6 +98,64 @@ def try_match_scale(node, scores_tensor, constants):
     c = float(np.asarray(constants[candidates[0]]).reshape(-1)[0])
     scale_value = c if node.op_type == "Mul" else 1.0 / c
     return scale_value, node.output[0]
+
+
+def _constant_value(tensor_name, constants):
+    if tensor_name not in constants:
+        return None
+    return float(np.asarray(constants[tensor_name]).reshape(-1)[0])
+
+
+def try_match_decomposed_gelu(nodes, i, constants, tensor_dims):
+    """Matches the 5-node decomposed GELU ONNX exporters emit at opset<20
+    (before `Gelu` existed as a fused op): `0.5*x*(1+erf(x/sqrt(2)))` as
+    `Div(x,sqrt2) -> Erf -> Add(1) -> Mul(x,·) -> Mul(0.5,·)`. Strictly
+    sequential (no parallel branches to interleave with other nodes, unlike
+    multi-head attention's Q/K/V split), so contiguous positional lookahead
+    is safe — same style as try_match_self_attention, not
+    try_match_multihead_attention's tensor-flow tracing.
+    Returns (ir_entry, next_index) or None."""
+    if i + 4 >= len(nodes):
+        return None
+    n0, n1, n2, n3, n4 = nodes[i:i + 5]
+
+    if n0.op_type != "Div":
+        return None
+    x_tensor = n0.input[0]
+    c1_candidates = [t for t in n0.input if t != x_tensor]
+    if len(c1_candidates) != 1:
+        return None
+    c1 = _constant_value(c1_candidates[0], constants)
+    if c1 is None or not math.isclose(c1, math.sqrt(2.0), rel_tol=1e-4):
+        return None
+
+    if n1.op_type != "Erf" or list(n1.input) != [n0.output[0]]:
+        return None
+
+    if n2.op_type != "Add" or n1.output[0] not in n2.input:
+        return None
+    c2_candidates = [t for t in n2.input if t != n1.output[0]]
+    if len(c2_candidates) != 1:
+        return None
+    c2 = _constant_value(c2_candidates[0], constants)
+    if c2 is None or not math.isclose(c2, 1.0, rel_tol=1e-4):
+        return None
+
+    if n3.op_type != "Mul" or sorted(n3.input) != sorted([x_tensor, n2.output[0]]):
+        return None
+
+    if n4.op_type != "Mul" or n3.output[0] not in n4.input:
+        return None
+    c3_candidates = [t for t in n4.input if t != n3.output[0]]
+    if len(c3_candidates) != 1:
+        return None
+    c3 = _constant_value(c3_candidates[0], constants)
+    if c3 is None or not math.isclose(c3, 0.5, rel_tol=1e-4):
+        return None
+
+    if x_tensor not in tensor_dims:
+        return None
+    return {"op": "gelu", "output": n4.output[0], "input": x_tensor, "dim": tensor_dims[x_tensor]}, i + 5
 
 
 def try_match_self_attention(nodes, i, constants, tensor_dims):
@@ -412,10 +480,18 @@ def parse_onnx(onnx_path):
             i += 1
             continue
 
+        gelu_match = try_match_decomposed_gelu(nodes, i, constants, tensor_dims)
+        if gelu_match is not None:
+            ir_entry, next_i = gelu_match
+            tensor_dims[ir_entry["output"]] = ir_entry["dim"]
+            ir.append(ir_entry)
+            i = next_i
+            continue
+
         if node.op_type not in SUPPORTED_OPS:
             raise UnsupportedGraph(
                 f"op '{node.op_type}' is not supported by this compiler outside the recognized "
-                f"self-attention / multi-head-attention patterns "
+                f"self-attention / multi-head-attention / decomposed-GELU patterns "
                 f"(supported standalone: {sorted(SUPPORTED_OPS)})"
             )
         if len(node.output) != 1:
