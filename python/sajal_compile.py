@@ -1,4 +1,4 @@
-"""exp15-22: the smallest real ONNX -> native C++ compiler.
+"""exp15-23: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -35,6 +35,14 @@ ONNX op. try_match_scale() now accepts either. Also added a `bench` mode
 to generated code (matching transformer.cpp's methodology exactly) and
 fixed `once_mode` to use the full sequence length for attention-containing
 models rather than a hardcoded single row.
+
+exp23: stacking multiple encoder blocks in one graph exposed a real bug in
+exp20's original multi-head matcher — it found its Q/K/V branches via a
+global scan for reshapes matching a (num_heads, d_head) shape, which
+silently merges branches from DIFFERENT attention instances once a graph
+contains more than one (every prior experiment had exactly one, so this
+never showed up). Rewrote try_match_multihead_attention to be purely
+tensor-flow-traced from wherever it starts — see its docstring.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -137,14 +145,25 @@ def try_match_self_attention(nodes, i, constants, tensor_dims):
 def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers):
     """Looks for the 12-node multi-head split/attend/merge pattern PyTorch's
     exporter emits for `q.view(seq,H,Dh).transpose(0,1)` etc: three
-    (Reshape->Transpose) branches splitting Q/K/V into heads, MatMul->Mul->
-    Softmax->MatMul attending per head (batched over the head dim), then a
-    final Transpose->Reshape merging heads back to [seq,D]. Unlike
+    (Reshape->Transpose) branches splitting Q/K/V into heads, MatMul->Mul/
+    Div->Softmax->MatMul attending per head (batched over the head dim),
+    then a final Transpose->Reshape merging heads back to [seq,D]. Unlike
     try_match_self_attention, these nodes are NOT contiguous in nodes[i:] —
     PyTorch interleaves Q/K/V's Gemm nodes with the Reshape/Transpose nodes
     of branches parsed earlier — so this searches by tensor-name flow
-    (who consumes whose output) rather than position, starting only when
-    nodes[i] looks like the first half of one head-split branch.
+    (who consumes whose output, who produces whose input) rather than
+    position, starting only when nodes[i] looks like the first half of one
+    head-split branch.
+
+    exp23: every lookup here traces a SPECIFIC tensor name forward or
+    backward from wherever nodes[i] sits (never "find all nodes shaped
+    like X anywhere in the graph") — necessary once a graph can contain
+    more than one attention instance (stacked encoder blocks): an earlier
+    version collected reshapes by matching shape/dim globally, which
+    silently merged branches from different blocks that happened to share
+    the same (num_heads, d_head). Being purely trace-driven makes this
+    correct regardless of how many other identically-shaped attention
+    blocks exist elsewhere in the same graph.
 
     Returns (ir_entry, consumed_indices) or None. consumed_indices is the
     full set of node indices this match uses; the caller must defer
@@ -175,21 +194,29 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
     def find_consumers(tensor_name, op_type):
         return [(idx, n) for idx, n in enumerate(nodes) if tensor_name in n.input and n.op_type == op_type]
 
+    def find_producer(tensor_name):
+        """Unfiltered — returns whichever node produces this tensor,
+        regardless of op_type, so the caller can branch on what kind of
+        node it turns out to be. Unlike exp20's original global shape scan,
+        every lookup in this function is tensor-name-exact, so it never
+        widens to nodes from a DIFFERENT attention instance even when
+        several blocks in a stack share the identical (num_heads, d_head)
+        shape (exp23: multi-block stacking exposed exactly this — the old
+        version collected reshapes from every block at once)."""
+        matches = [(idx, n) for idx, n in enumerate(nodes) if list(n.output) == [tensor_name]]
+        return matches[0] if len(matches) == 1 else None
+
     def perm_of(transpose_node):
         return next((list(a.ints) for a in transpose_node.attribute if a.name == "perm"), None)
 
-    reshape_group = [
-        idx for idx, n in enumerate(nodes)
-        if n.op_type == "Reshape" and n.input[1] in constants
-        and [int(x) for x in np.asarray(constants[n.input[1]]).reshape(-1)] == shape0
-        and resolve_dim(n.input[0]) == d
-    ]
-    if len(reshape_group) != 3 or i not in reshape_group:
-        return None
-
-    branches = []
-    for r_idx in reshape_group:
-        r_node = nodes[r_idx]
+    def branch_from_reshape(r_idx, r_node):
+        """(Reshape, Transpose) pair starting at r_node — verifies shape/dim
+        match and returns the branch dict, or None."""
+        if r_node.input[1] not in constants:
+            return None
+        shape = [int(x) for x in np.asarray(constants[r_node.input[1]]).reshape(-1)]
+        if shape != shape0 or resolve_dim(r_node.input[0]) != d:
+            return None
         consumers = find_consumers(r_node.output[0], "Transpose")
         if len(consumers) != 1:
             return None
@@ -197,46 +224,113 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         perm = perm_of(t_node)
         if perm is None or len(perm) != 3:
             return None
-        branches.append({"reshape_idx": r_idx, "transpose_idx": t_idx, "perm": perm,
-                          "out": t_node.output[0], "linear": r_node.input[0]})
+        return {"reshape_idx": r_idx, "transpose_idx": t_idx, "perm": perm,
+                "out": t_node.output[0], "linear": r_node.input[0]}
 
-    k_branches = [b for b in branches if b["perm"] == [1, 2, 0]]
-    qv_branches = [b for b in branches if b["perm"] == [1, 0, 2]]
-    if len(k_branches) != 1 or len(qv_branches) != 2:
-        return None
-    k_branch = k_branches[0]
+    def branch_from_transposed_tensor(tensor_name):
+        """Traces backward from a Transpose's output tensor to its
+        (Reshape, Transpose) branch."""
+        producer = find_producer(tensor_name)
+        if producer is None or producer[1].op_type != "Transpose":
+            return None
+        t_idx, t_node = producer
+        r_producer = find_producer(t_node.input[0])
+        if r_producer is None or r_producer[1].op_type != "Reshape":
+            return None
+        r_idx, r_node = r_producer
+        branch = branch_from_reshape(r_idx, r_node)
+        if branch is None or branch["transpose_idx"] != t_idx:
+            return None
+        return branch
 
-    mm_pre = find_consumers(k_branch["out"], "MatMul")
-    if len(mm_pre) != 1:
+    branch0 = branch_from_reshape(i, node0)
+    if branch0 is None:
         return None
-    mm_pre_idx, mm_pre_node = mm_pre[0]
-    other = [x for x in mm_pre_node.input if x != k_branch["out"]]
+
+    mm_a_matches = find_consumers(branch0["out"], "MatMul")
+    if len(mm_a_matches) != 1:
+        return None
+    mm_a_idx, mm_a_node = mm_a_matches[0]
+    other = [x for x in mm_a_node.input if x != branch0["out"]]
     if len(other) != 1:
         return None
-    q_branch = next((b for b in qv_branches if b["out"] == other[0]), None)
-    if q_branch is None:
+    other_producer = find_producer(other[0])
+    if other_producer is None:
         return None
-    v_branch = next(b for b in qv_branches if b is not q_branch)
 
-    scale_matches = find_consumers(mm_pre_node.output[0], "Mul") + find_consumers(mm_pre_node.output[0], "Div")
-    if len(scale_matches) != 1:
-        return None
-    mul_idx, mul_node = scale_matches[0]
-    scale_match = try_match_scale(mul_node, mm_pre_node.output[0], constants)
-    if scale_match is None:
-        return None
-    scale_value, scaled_tensor = scale_match
+    if other_producer[1].op_type == "Softmax":
+        # branch0 is V (feeds the post-softmax MatMul); trace backward
+        # through softmax -> scale -> mm_pre to find Q and K.
+        if branch0["perm"] != [1, 0, 2]:
+            return None
+        v_branch = branch0
+        mm_post_idx, mm_post_node = mm_a_idx, mm_a_node
+        softmax_idx, softmax_node = other_producer
+        scale_producer = find_producer(softmax_node.input[0])
+        if scale_producer is None or scale_producer[1].op_type not in ("Mul", "Div"):
+            return None
+        mul_idx, mul_node = scale_producer
+        pre_scale_tensor = [x for x in mul_node.input if x not in constants]
+        if len(pre_scale_tensor) != 1:
+            return None
+        scale_match = try_match_scale(mul_node, pre_scale_tensor[0], constants)
+        if scale_match is None:
+            return None
+        scale_value = scale_match[0]
+        mm_pre_producer = find_producer(pre_scale_tensor[0])
+        if mm_pre_producer is None or mm_pre_producer[1].op_type != "MatMul":
+            return None
+        mm_pre_idx, mm_pre_node = mm_pre_producer
+        qk_tensors = list(mm_pre_node.input)
+        if len(qk_tensors) != 2:
+            return None
+        branch_a = branch_from_transposed_tensor(qk_tensors[0])
+        branch_b = branch_from_transposed_tensor(qk_tensors[1])
+        if branch_a is None or branch_b is None:
+            return None
+        k_branch = next((b for b in (branch_a, branch_b) if b["perm"] == [1, 2, 0]), None)
+        q_branch = next((b for b in (branch_a, branch_b) if b["perm"] == [1, 0, 2] and b is not k_branch), None)
+        if k_branch is None or q_branch is None or k_branch is q_branch:
+            return None
+    elif other_producer[1].op_type == "Transpose":
+        # branch0 is Q or K (both feed mm_pre, the pre-softmax MatMul);
+        # trace forward through scale -> softmax -> mm_post to find V.
+        other_branch = branch_from_transposed_tensor(other[0])
+        if other_branch is None:
+            return None
+        mm_pre_idx, mm_pre_node = mm_a_idx, mm_a_node
+        if branch0["perm"] == [1, 2, 0] and other_branch["perm"] == [1, 0, 2]:
+            k_branch, q_branch = branch0, other_branch
+        elif branch0["perm"] == [1, 0, 2] and other_branch["perm"] == [1, 2, 0]:
+            q_branch, k_branch = branch0, other_branch
+        else:
+            return None
 
-    softmax_matches = find_consumers(scaled_tensor, "Softmax")
-    if len(softmax_matches) != 1:
-        return None
-    softmax_idx, softmax_node = softmax_matches[0]
+        scale_matches = find_consumers(mm_pre_node.output[0], "Mul") + find_consumers(mm_pre_node.output[0], "Div")
+        if len(scale_matches) != 1:
+            return None
+        mul_idx, mul_node = scale_matches[0]
+        scale_match = try_match_scale(mul_node, mm_pre_node.output[0], constants)
+        if scale_match is None:
+            return None
+        scale_value, scaled_tensor = scale_match
 
-    mm_post_matches = find_consumers(softmax_node.output[0], "MatMul")
-    if len(mm_post_matches) != 1:
-        return None
-    mm_post_idx, mm_post_node = mm_post_matches[0]
-    if [x for x in mm_post_node.input if x != softmax_node.output[0]] != [v_branch["out"]]:
+        softmax_matches = find_consumers(scaled_tensor, "Softmax")
+        if len(softmax_matches) != 1:
+            return None
+        softmax_idx, softmax_node = softmax_matches[0]
+
+        mm_post_matches = find_consumers(softmax_node.output[0], "MatMul")
+        if len(mm_post_matches) != 1:
+            return None
+        mm_post_idx, mm_post_node = mm_post_matches[0]
+        v_candidates = [x for x in mm_post_node.input if x != softmax_node.output[0]]
+        if len(v_candidates) != 1:
+            return None
+        v_branch = branch_from_transposed_tensor(v_candidates[0])
+        if v_branch is None or v_branch["perm"] != [1, 0, 2]:
+            return None
+    else:
         return None
 
     final_t_matches = find_consumers(mm_post_node.output[0], "Transpose")
@@ -256,6 +350,7 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
     if len(final_shape) != 2 or final_shape[-1] != d:
         return None
 
+    branches = (q_branch, k_branch, v_branch)
     consumed = {b["reshape_idx"] for b in branches} | {b["transpose_idx"] for b in branches} | {
         mm_pre_idx, mul_idx, softmax_idx, mm_post_idx, final_t_idx, final_r_idx,
     }
