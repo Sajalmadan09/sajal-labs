@@ -1,23 +1,29 @@
-"""exp15-18: the smallest real ONNX -> native C++ compiler.
+"""exp15-20: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
 added Add for residual connections.
-exp18 (this version): single-head self-attention. NOT general MatMul/
-Transpose support — this compiler recognizes exactly one 5-node pattern
-(Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul(scale) -> Softmax -> MatMul(V))
-as a single fused "self_attention" IR op, and rejects anything that doesn't
-match this exact shape. That's a deliberate, narrower claim than "supports
-attention" — multi-head (reshape/transpose per head) is a separate, larger
-step, not attempted here (see exp18's results.md).
+exp18: single-head self-attention. NOT general MatMul/Transpose support —
+this compiler recognizes exactly one 5-node pattern (Transpose(K,[1,0]) ->
+MatMul(Q,K^T) -> Mul(scale) -> Softmax -> MatMul(V)) as a single fused
+"self_attention" IR op, and rejects anything that doesn't match this exact
+shape.
+exp20 (this version): multi-head self-attention. PyTorch's exporter emits
+the 3-way Reshape/Transpose head-split interleaved with the Q/K/V Gemm
+nodes (not contiguous — a Gemm for K or V often sits between Q's Reshape
+and the rest of the pattern), so this can't reuse exp18's contiguous
+next-5-nodes lookahead. try_match_multihead_attention instead searches the
+whole node list by tensor-name flow (who consumes whose output) to find the
+12-node pattern regardless of position, then defers emitting its IR entry
+until the main walk reaches the LAST consumed node index, so the generated
+C++ still declares Q/K/V's linear outputs before the fused op uses them.
 
-Codegen for the fused op reuses the exact BLAS trick already validated in
-native/transformer_model.hpp and native/bert_model.hpp: Q@K^T is one
-cblas_sgemm call with CblasTrans on K (no physical transpose, no separate
-IR/codegen handling for the Transpose node — it's consumed entirely inside
-the fusion), scaled attention @ V is a second cblas_sgemm call. This is not
-new numerical code, it's the same validated pattern, now reachable from a
-compiled ONNX graph instead of only from hand-written headers.
+Codegen for both fused attention ops reuses the exact BLAS trick already
+validated in native/transformer_model.hpp and native/bert_model.hpp: Q@K^T
+via CblasTrans on K, no physical transpose; multi-head loops that per two
+cblas_sgemm calls over head-sized column slices (pointer offset + full-row
+stride, no physical splitting either). Not new numerical code — the same
+validated pattern, now reachable from a compiled ONNX graph.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -101,6 +107,137 @@ def try_match_self_attention(nodes, i, constants, tensor_dims):
     return ir_entry, i + 5
 
 
+def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers):
+    """Looks for the 12-node multi-head split/attend/merge pattern PyTorch's
+    exporter emits for `q.view(seq,H,Dh).transpose(0,1)` etc: three
+    (Reshape->Transpose) branches splitting Q/K/V into heads, MatMul->Mul->
+    Softmax->MatMul attending per head (batched over the head dim), then a
+    final Transpose->Reshape merging heads back to [seq,D]. Unlike
+    try_match_self_attention, these nodes are NOT contiguous in nodes[i:] —
+    PyTorch interleaves Q/K/V's Gemm nodes with the Reshape/Transpose nodes
+    of branches parsed earlier — so this searches by tensor-name flow
+    (who consumes whose output) rather than position, starting only when
+    nodes[i] looks like the first half of one head-split branch.
+
+    Returns (ir_entry, consumed_indices) or None. consumed_indices is the
+    full set of node indices this match uses; the caller must defer
+    appending ir_entry to the IR list until it reaches max(consumed_indices)
+    — Q/K/V's own Gemm nodes (not part of consumed_indices) may sit at
+    later positions than nodes[i], and the generated C++ must declare their
+    outputs before the fused op reads them."""
+    node0 = nodes[i]
+    if node0.op_type != "Reshape" or node0.input[1] not in constants:
+        return None
+    shape0 = [int(x) for x in np.asarray(constants[node0.input[1]]).reshape(-1)]
+    if len(shape0) != 3:
+        return None
+    num_heads, d_head = shape0[1], shape0[2]
+    d = num_heads * d_head
+
+    def resolve_dim(tensor_name):
+        if tensor_name in tensor_dims:
+            return tensor_dims[tensor_name]
+        for n in nodes:
+            if n.op_type == "Gemm" and list(n.output) == [tensor_name] and n.input[1] in initializers:
+                return int(initializers[n.input[1]].shape[0])
+        return None
+
+    if resolve_dim(node0.input[0]) != d:
+        return None
+
+    def find_consumers(tensor_name, op_type):
+        return [(idx, n) for idx, n in enumerate(nodes) if tensor_name in n.input and n.op_type == op_type]
+
+    def perm_of(transpose_node):
+        return next((list(a.ints) for a in transpose_node.attribute if a.name == "perm"), None)
+
+    reshape_group = [
+        idx for idx, n in enumerate(nodes)
+        if n.op_type == "Reshape" and n.input[1] in constants
+        and [int(x) for x in np.asarray(constants[n.input[1]]).reshape(-1)] == shape0
+        and resolve_dim(n.input[0]) == d
+    ]
+    if len(reshape_group) != 3 or i not in reshape_group:
+        return None
+
+    branches = []
+    for r_idx in reshape_group:
+        r_node = nodes[r_idx]
+        consumers = find_consumers(r_node.output[0], "Transpose")
+        if len(consumers) != 1:
+            return None
+        t_idx, t_node = consumers[0]
+        perm = perm_of(t_node)
+        if perm is None or len(perm) != 3:
+            return None
+        branches.append({"reshape_idx": r_idx, "transpose_idx": t_idx, "perm": perm,
+                          "out": t_node.output[0], "linear": r_node.input[0]})
+
+    k_branches = [b for b in branches if b["perm"] == [1, 2, 0]]
+    qv_branches = [b for b in branches if b["perm"] == [1, 0, 2]]
+    if len(k_branches) != 1 or len(qv_branches) != 2:
+        return None
+    k_branch = k_branches[0]
+
+    mm_pre = find_consumers(k_branch["out"], "MatMul")
+    if len(mm_pre) != 1:
+        return None
+    mm_pre_idx, mm_pre_node = mm_pre[0]
+    other = [x for x in mm_pre_node.input if x != k_branch["out"]]
+    if len(other) != 1:
+        return None
+    q_branch = next((b for b in qv_branches if b["out"] == other[0]), None)
+    if q_branch is None:
+        return None
+    v_branch = next(b for b in qv_branches if b is not q_branch)
+
+    mul_matches = find_consumers(mm_pre_node.output[0], "Mul")
+    if len(mul_matches) != 1:
+        return None
+    mul_idx, mul_node = mul_matches[0]
+    scale_candidates = [x for x in mul_node.input if x != mm_pre_node.output[0]]
+    if len(scale_candidates) != 1 or scale_candidates[0] not in constants:
+        return None
+    scale_value = float(np.asarray(constants[scale_candidates[0]]).reshape(-1)[0])
+
+    softmax_matches = find_consumers(mul_node.output[0], "Softmax")
+    if len(softmax_matches) != 1:
+        return None
+    softmax_idx, softmax_node = softmax_matches[0]
+
+    mm_post_matches = find_consumers(softmax_node.output[0], "MatMul")
+    if len(mm_post_matches) != 1:
+        return None
+    mm_post_idx, mm_post_node = mm_post_matches[0]
+    if [x for x in mm_post_node.input if x != softmax_node.output[0]] != [v_branch["out"]]:
+        return None
+
+    final_t_matches = find_consumers(mm_post_node.output[0], "Transpose")
+    if len(final_t_matches) != 1:
+        return None
+    final_t_idx, final_t_node = final_t_matches[0]
+    if perm_of(final_t_node) != [1, 0, 2]:
+        return None
+
+    final_r_matches = find_consumers(final_t_node.output[0], "Reshape")
+    if len(final_r_matches) != 1:
+        return None
+    final_r_idx, final_r_node = final_r_matches[0]
+    if final_r_node.input[1] not in constants:
+        return None
+    final_shape = [int(x) for x in np.asarray(constants[final_r_node.input[1]]).reshape(-1)]
+    if len(final_shape) != 2 or final_shape[-1] != d:
+        return None
+
+    consumed = {b["reshape_idx"] for b in branches} | {b["transpose_idx"] for b in branches} | {
+        mm_pre_idx, mul_idx, softmax_idx, mm_post_idx, final_t_idx, final_r_idx,
+    }
+    ir_entry = {"op": "multihead_self_attention", "q": q_branch["linear"], "k": k_branch["linear"],
+                "v": v_branch["linear"], "num_heads": num_heads, "d_head": d_head,
+                "scale": scale_value, "output": final_r_node.output[0], "dim": d}
+    return ir_entry, consumed
+
+
 def parse_onnx(onnx_path):
     model = onnx.load(str(onnx_path))
     graph = model.graph
@@ -121,8 +258,19 @@ def parse_onnx(onnx_path):
 
     ir = []
     tensor_dims = {}
+    consumed_skip = set()
+    pending_emit = {}
     i = 0
     while i < len(nodes):
+        if i in pending_emit:
+            ir_entry = pending_emit.pop(i)
+            tensor_dims[ir_entry["output"]] = ir_entry["dim"]
+            ir.append(ir_entry)
+            i += 1
+            continue
+        if i in consumed_skip:
+            i += 1
+            continue
         node = nodes[i]
 
         match = try_match_self_attention(nodes, i, constants, tensor_dims)
@@ -133,10 +281,20 @@ def parse_onnx(onnx_path):
             i = next_i
             continue
 
+        mh_match = try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers)
+        if mh_match is not None:
+            ir_entry, consumed = mh_match
+            emit_at = max(consumed)
+            consumed_skip |= consumed - {emit_at}
+            pending_emit[emit_at] = ir_entry
+            i += 1
+            continue
+
         if node.op_type not in SUPPORTED_OPS:
             raise UnsupportedGraph(
                 f"op '{node.op_type}' is not supported by this compiler outside the recognized "
-                f"self-attention pattern (supported standalone: {sorted(SUPPORTED_OPS)})"
+                f"self-attention / multi-head-attention patterns "
+                f"(supported standalone: {sorted(SUPPORTED_OPS)})"
             )
         if len(node.output) != 1:
             raise UnsupportedGraph(f"op '{node.op_type}' has multiple outputs, not supported")
@@ -271,6 +429,27 @@ def generate_cpp(ir, graph_input_name):
                 f"        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, {d}, n, 1.0f, "
                 f"{scores_var}.data(), n, {v_var}.data(), {d}, 0.0f, {out_var}.data(), {d});"
             )
+        elif op["op"] == "multihead_self_attention":
+            q_var, k_var, v_var = var(op["q"]), var(op["k"]), var(op["v"])
+            d, dh, h_count, scale = op["dim"], op["d_head"], op["num_heads"], op["scale"]
+            scores_var = out_var + "_scores"
+            # Per-head loop with the same BLAS lda/ldb stride trick as
+            # native/transformer_model.hpp: head h's Q/K/V is the column
+            # slice [h*dh, (h+1)*dh) of the full [n,d] buffer, addressed by
+            # pointer offset + full-row stride d — no physical splitting.
+            forward_lines.append(f"        std::vector<float> {scores_var}(static_cast<size_t>(n) * n);")
+            forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {d});")
+            forward_lines.append(f"        for (int h = 0; h < {h_count}; ++h) {{")
+            forward_lines.append(
+                f"            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, n, {dh}, {scale}f, "
+                f"{q_var}.data() + h * {dh}, {d}, {k_var}.data() + h * {dh}, {d}, 0.0f, {scores_var}.data(), n);"
+            )
+            forward_lines.append(f"            softmax_rows({scores_var}.data(), n, n);")
+            forward_lines.append(
+                f"            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, {dh}, n, 1.0f, "
+                f"{scores_var}.data(), n, {v_var}.data() + h * {dh}, {d}, 0.0f, {out_var}.data() + h * {dh}, {d});"
+            )
+            forward_lines.append("        }")
 
     body = "\n".join(forward_lines)
 
