@@ -75,6 +75,12 @@ inline void softmax_rows(float* data, int rows, int cols) {
     }
 }
 
+// exp17: elementwise add, needed for residual/skip connections (y = x +
+// sublayer(x)) once the compiler's IR became a DAG instead of a flat chain.
+inline void add_inplace(float* dst, const float* src, size_t n) {
+    for (size_t i = 0; i < n; ++i) dst[i] += src[i];
+}
+
 // Multi-head self-attention computed WITHOUT calling into cblas_sgemm.
 // exp5 (research/experiments/exp5-gemm-dispatch-overhead/results.md) found
 // Accelerate's per-cblas_sgemm-call dispatch cost dominates at exactly this

@@ -66,6 +66,7 @@ Model "kind" (`mlp`, `transformer`, `text-mlp`, or `bert`) is detected from what
 14. [WordPiece in C++](research/experiments/exp14-wordpiece-native/results.md) — real BERT tokenizer ported, exact token match on 17 real sentences; native beats even lean-tokenizer ONNX by 8.4x, and tokenizer library choice alone swings Python cold-start 26x
 15. [Minimal ONNX→C++ compiler](research/experiments/exp15-minimal-compiler/results.md) — the first real compiler, not a hand-port: auto-generated code from exp1/exp9's ONNX graphs is bit-identical to the hand-written reference, `sajal` CLI works on the output with zero modification, fails cleanly on out-of-scope graphs
 16. [LayerNorm + GELU in the compiler](research/experiments/exp16-layernorm-gelu/results.md) — generalized codegen (IR-driven, not a fixed template) to 5 ops; still bit-identical to a hand-written reference; caught and avoided a real correctness trap (reusing exp15's artifact convention would have let `sajal` silently misread the new graph shape)
+17. [DAG support](research/experiments/exp17-dag-support/results.md) — the IR became a real graph (named tensors, not "previous op's output"); compiled a genuine residual connection (`LayerNorm(x + sublayer(x))`, the actual FFN half of a transformer block) bit-identical to a hand-written reference; exercised a validation check exp16 had flagged as unreachable
 
 ## Roadmap
 
@@ -80,4 +81,4 @@ Model "kind" (`mlp`, `transformer`, `text-mlp`, or `bert`) is detected from what
 8. Transformer support — done (exp11: real pretrained BERT, [native/bert_model.hpp](native/bert_model.hpp), fp32-tight equivalence on 10 real sentences)
 9. Hardware optimization (SIMD/CUDA) — Apple Accelerate/AMX only so far; no CUDA hardware available
 10. Research publication
-11. Model compiler (ONNX → native C++, not hand-porting) — in progress (exp15-16: [python/sajal_compile.py](python/sajal_compile.py), 5 ops incl. LayerNorm/GELU, IR-driven codegen, bit-identical to hand-written references; still sequential-chain-only — attention/residual connections need the IR to become a DAG, not yet done)
+11. Model compiler (ONNX → native C++, not hand-porting) — in progress (exp15-17: [python/sajal_compile.py](python/sajal_compile.py), 6 ops incl. LayerNorm/GELU/Add, real DAG-based IR, bit-identical to hand-written references incl. a genuine residual connection; attention not yet supported — needs runtime-tensor MatMul + reshape/transpose, a bigger step than the DAG rewrite)

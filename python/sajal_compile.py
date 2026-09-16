@@ -1,31 +1,29 @@
-"""exp15/16: the smallest real ONNX -> native C++ compiler. exp15 supported
-exactly Gemm->Relu->Gemm->Softmax (a fixed 4-op template); exp16 generalizes
-this to arbitrary SEQUENTIAL chains of {Gemm, Relu, LayerNormalization,
-Gelu, Softmax} — LayerNorm and GELU added, still no attention.
+"""exp15/16/17: the smallest real ONNX -> native C++ compiler.
+exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
+exp16: generalized to arbitrary sequential chains of 5 ops (added LayerNorm/
+GELU), still a flat IR where each op implicitly consumes "whatever the
+previous op produced".
+exp17 (this version): the IR became a real DAG. Each op now records its
+ACTUAL named input tensor(s) and output tensor name, resolved from the ONNX
+graph directly — not "the previous op's output". This is what residual
+connections (y = LayerNorm(x + sublayer(x))) and, eventually, attention's
+Q/K/V branching actually need: a tensor gets consumed more than once,
+non-adjacently, which a flat chain has no way to represent.
 
-Deliberately still narrow, stated explicitly: "sequential chain" means each
-op consumes exactly the previous op's output (plus weight initializers) and
-produces exactly one new tensor. A residual/skip connection — the pattern
-every real transformer block uses (x = LayerNorm(x + sublayer(x))) — has a
-node with TWO non-initializer inputs (the sublayer output AND the original
-x), which this compiler detects and explicitly refuses rather than silently
-mishandling. Supporting that needs the IR to be a real DAG, not a flat list
-— deferred to when attention is added (attention itself also branches: Q/K/V
-all read the same input), not attempted here.
+Added op: Add (elementwise, exactly 2 non-initializer tensor inputs — a
+residual connection, not a bias-add, which our Gemm nodes already fold in).
 
-Codegen emits CALLS to common.hpp's existing, already-validated ops
-(linear/relu_inplace/gelu_inplace/layernorm_rows/softmax_rows) — never a new
-numerical kernel. Output artifact convention: weights extracted to
-<sanitized-initializer-name>.bin files, dims baked into the generated code
-as compile-time constants (no runtime shape parsing needed for the model
-itself), plus a small test_config.txt (just "in_dim n_test") so the driver
-knows how to size test_inputs.bin. This is intentionally NOT exp15's old
-4-field shapes.txt convention — that convention coincidentally matched
-mlp_model.hpp's fixed struct shape, which no longer holds once LayerNorm/
-GELU are in the mix; reusing it here would let `sajal`'s existing "mlp kind"
-detection silently misinterpret a richer graph as a plain MLP and compute
-the wrong thing. Teaching `sajal` to recognize this newer, more general
-convention is future work — not done here, stated as a real caveat.
+Codegen changed accordingly: instead of threading one "cur" buffer through
+generated code, it declares one std::vector<float> per unique ONNX tensor
+name that gets produced, and each op reads its named input variable(s) and
+writes its named output variable — a real (if still restricted: no control
+flow, no loops, fixed shapes) dataflow graph in C++, not just a chain.
+
+Still narrow, stated explicitly: no attention yet (Q/K/V branching from one
+input needs the same DAG machinery this experiment adds, but attention's
+per-head reshape/transpose/batched-matmul is a different, larger step, not
+attempted here). No opset<20 decomposed-GELU pattern-matching. No dynamic
+shapes or control flow (If/Loop/Scan).
 """
 import pathlib
 import shutil
@@ -38,7 +36,7 @@ from onnx import numpy_helper
 
 NATIVE_DIR = pathlib.Path(__file__).parent.parent / "native"
 
-SUPPORTED_OPS = {"Gemm", "Relu", "LayerNormalization", "Gelu", "Softmax"}
+SUPPORTED_OPS = {"Gemm", "Relu", "LayerNormalization", "Gelu", "Softmax", "Add"}
 
 
 class UnsupportedGraph(Exception):
@@ -56,9 +54,10 @@ def parse_onnx(onnx_path):
     graph = model.graph
     initializers = {init.name: numpy_helper.to_array(init) for init in graph.initializer}
     initializer_names = set(initializers.keys())
+    graph_input_name = graph.input[0].name
 
     ir = []
-    current_tensor = graph.input[0].name
+    tensor_dims = {}  # ONNX tensor name -> channel dim, filled in as we discover it
 
     for node in graph.node:
         if node.op_type not in SUPPORTED_OPS:
@@ -66,98 +65,126 @@ def parse_onnx(onnx_path):
                 f"op '{node.op_type}' is not supported by this compiler "
                 f"(supported: {sorted(SUPPORTED_OPS)})"
             )
-
-        non_init_inputs = [i for i in node.input if i not in initializer_names]
-        if non_init_inputs != [current_tensor]:
-            raise UnsupportedGraph(
-                f"op '{node.op_type}' (output {node.output[0]!r}) has non-sequential inputs "
-                f"{non_init_inputs} — expected exactly the previous op's output {current_tensor!r}. "
-                f"This compiler only supports simple sequential chains, not branching/residual graphs "
-                f"(e.g. LayerNorm(x + sublayer(x)) needs two inputs to the Add — not supported yet)."
-            )
         if len(node.output) != 1:
             raise UnsupportedGraph(f"op '{node.op_type}' has multiple outputs, not supported")
 
+        non_init_inputs = [i for i in node.input if i not in initializer_names]
+        out_name = node.output[0]
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
 
         if node.op_type == "Gemm":
             if attrs.get("transB", 0) != 1 or attrs.get("alpha", 1.0) != 1.0 or attrs.get("beta", 1.0) != 1.0:
                 raise UnsupportedGraph(f"Gemm with non-standard attrs (need transB=1, alpha=beta=1): {attrs}")
+            if len(non_init_inputs) != 1:
+                raise UnsupportedGraph(f"Gemm with {len(non_init_inputs)} tensor inputs, expected 1")
+            in_tensor = non_init_inputs[0]
             _, w_name, b_name = node.input
             out_dim, in_dim = initializers[w_name].shape
-            ir.append({"op": "linear", "weight": w_name, "bias": b_name,
-                       "in_dim": int(in_dim), "out_dim": int(out_dim)})
-        elif node.op_type == "Relu":
-            ir.append({"op": "relu"})
+            tensor_dims[in_tensor] = int(in_dim)  # learned retroactively from the weight shape
+            tensor_dims[out_name] = int(out_dim)
+            ir.append({"op": "linear", "output": out_name, "input": in_tensor,
+                       "weight": w_name, "bias": b_name, "in_dim": int(in_dim), "out_dim": int(out_dim)})
+
+        elif node.op_type in ("Relu", "Gelu", "Softmax"):
+            if len(non_init_inputs) != 1:
+                raise UnsupportedGraph(f"{node.op_type} with {len(non_init_inputs)} tensor inputs, expected 1")
+            in_tensor = non_init_inputs[0]
+            if node.op_type == "Gelu":
+                approx = attrs.get("approximate", b"none")
+                if approx not in (b"none", "none"):
+                    raise UnsupportedGraph(f"Gelu approximate={approx!r} not supported — only exact/erf-based GELU")
+            if node.op_type == "Softmax" and attrs.get("axis", -1) not in (-1, 1):
+                raise UnsupportedGraph(f"Softmax over unsupported axis: {attrs.get('axis')}")
+            op_name = {"Relu": "relu", "Gelu": "gelu", "Softmax": "softmax"}[node.op_type]
+            tensor_dims[out_name] = tensor_dims[in_tensor]
+            ir.append({"op": op_name, "output": out_name, "input": in_tensor, "dim": tensor_dims[in_tensor]})
+
         elif node.op_type == "LayerNormalization":
             if attrs.get("axis", -1) != -1:
                 raise UnsupportedGraph(f"LayerNormalization over unsupported axis: {attrs.get('axis')}")
+            if len(non_init_inputs) != 1:
+                raise UnsupportedGraph(f"LayerNormalization with {len(non_init_inputs)} tensor inputs, expected 1")
+            in_tensor = non_init_inputs[0]
             _, w_name, b_name = node.input
             dim = int(initializers[w_name].shape[0])
             eps = float(attrs.get("epsilon", 1e-5))
-            ir.append({"op": "layernorm", "weight": w_name, "bias": b_name, "dim": dim, "eps": eps})
-        elif node.op_type == "Gelu":
-            approx = attrs.get("approximate", b"none")
-            if approx not in (b"none", "none"):
-                raise UnsupportedGraph(
-                    f"Gelu approximate={approx!r} not supported — only exact/erf-based GELU "
-                    f"(matching common.hpp's gelu_inplace) is implemented"
-                )
-            ir.append({"op": "gelu"})
-        elif node.op_type == "Softmax":
-            axis = attrs.get("axis", -1)
-            if axis not in (-1, 1):
-                raise UnsupportedGraph(f"Softmax over unsupported axis: {axis}")
-            ir.append({"op": "softmax"})
+            tensor_dims[out_name] = dim
+            ir.append({"op": "layernorm", "output": out_name, "input": in_tensor,
+                       "weight": w_name, "bias": b_name, "dim": dim, "eps": eps})
 
-        current_tensor = node.output[0]
+        elif node.op_type == "Add":
+            if len(non_init_inputs) != 2:
+                raise UnsupportedGraph(
+                    f"Add with {len(non_init_inputs)} non-initializer inputs, expected exactly 2 "
+                    f"(a residual/skip connection) — bias-add is not this compiler's concern, "
+                    f"Gemm nodes already fold their bias in"
+                )
+            a, b = non_init_inputs
+            if a not in tensor_dims or b not in tensor_dims:
+                raise UnsupportedGraph(f"Add operand dim not yet known (graph not in topological order?): {a}, {b}")
+            if tensor_dims[a] != tensor_dims[b]:
+                raise UnsupportedGraph(f"Add between mismatched dims: {tensor_dims[a]} vs {tensor_dims[b]}")
+            tensor_dims[out_name] = tensor_dims[a]
+            ir.append({"op": "add", "output": out_name, "inputs": [a, b], "dim": tensor_dims[a]})
 
     if not ir or ir[0]["op"] != "linear":
         raise UnsupportedGraph("this compiler requires the graph to start with a Linear (Gemm) layer")
 
-    return ir, initializers
+    return ir, initializers, graph_input_name
 
 
-def generate_cpp(ir):
-    """One block of C++ per IR op, calling common.hpp's shared ops —
-    genuinely generated from the IR list (length and contents vary per
-    model), not filled into a fixed template."""
+def generate_cpp(ir, graph_input_name):
+    """One block of C++ per IR op, reading/writing named variables that
+    correspond directly to ONNX tensor names — a real dataflow graph, not a
+    single threaded-through buffer. Declares one std::vector<float> per
+    unique tensor produced; the graph's own input tensor maps to the
+    function parameter X directly, no separate copy."""
+
+    def var(tensor_name):
+        return "X" if tensor_name == graph_input_name else cpp_id(tensor_name)
+
     input_dim = ir[0]["in_dim"]
     output_dim = next(op["out_dim"] for op in reversed(ir) if op["op"] == "linear")
+    final_output_var = var(ir[-1]["output"])
 
     member_decls, load_lines, forward_lines = [], [], []
-    forward_lines.append("        std::vector<float> cur = X;")
-    forward_lines.append("        int cur_dim = INPUT_DIM;")
 
     for op in ir:
+        out_var = var(op["output"])
         if op["op"] == "linear":
             w, b = cpp_id(op["weight"]), cpp_id(op["bias"])
             member_decls.append(f"    std::vector<float> {w}, {b};")
             load_lines.append(f'    m.{w} = load_f32(dir + "/{w}.bin", static_cast<size_t>({op["out_dim"]}) * {op["in_dim"]});')
             load_lines.append(f'    m.{b} = load_f32(dir + "/{b}.bin", {op["out_dim"]});')
-            forward_lines.append("        {")
-            forward_lines.append(f"            std::vector<float> next(static_cast<size_t>(n) * {op['out_dim']});")
-            forward_lines.append(f"            linear(cur.data(), n, cur_dim, {w}.data(), {b}.data(), {op['out_dim']}, next.data());")
-            forward_lines.append(f"            cur = std::move(next); cur_dim = {op['out_dim']};")
-            forward_lines.append("        }")
-        elif op["op"] == "relu":
-            forward_lines.append("        relu_inplace(cur.data(), cur.size());")
-        elif op["op"] == "gelu":
-            forward_lines.append("        gelu_inplace(cur.data(), cur.size());")
+            in_var = var(op["input"])
+            forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {op['out_dim']});")
+            forward_lines.append(f"        linear({in_var}.data(), n, {op['in_dim']}, {w}.data(), {b}.data(), {op['out_dim']}, {out_var}.data());")
+        elif op["op"] in ("relu", "gelu", "softmax"):
+            in_var = var(op["input"])
+            forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
+            fn = {"relu": "relu_inplace", "gelu": "gelu_inplace", "softmax": None}[op["op"]]
+            if op["op"] == "softmax":
+                forward_lines.append(f"        softmax_rows({out_var}.data(), n, {op['dim']});")
+            else:
+                forward_lines.append(f"        {fn}({out_var}.data(), {out_var}.size());")
         elif op["op"] == "layernorm":
             w, b = cpp_id(op["weight"]), cpp_id(op["bias"])
             member_decls.append(f"    std::vector<float> {w}, {b};")
             load_lines.append(f'    m.{w} = load_f32(dir + "/{w}.bin", {op["dim"]});')
             load_lines.append(f'    m.{b} = load_f32(dir + "/{b}.bin", {op["dim"]});')
-            forward_lines.append(f"        layernorm_rows(cur.data(), n, cur_dim, {w}.data(), {b}.data(), {op['eps']}f);")
-        elif op["op"] == "softmax":
-            forward_lines.append("        softmax_rows(cur.data(), n, cur_dim);")
+            in_var = var(op["input"])
+            forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
+            forward_lines.append(f"        layernorm_rows({out_var}.data(), n, {op['dim']}, {w}.data(), {b}.data(), {op['eps']}f);")
+        elif op["op"] == "add":
+            a_var, b_var = var(op["inputs"][0]), var(op["inputs"][1])
+            forward_lines.append(f"        std::vector<float> {out_var} = {a_var};")
+            forward_lines.append(f"        add_inplace({out_var}.data(), {b_var}.data(), {out_var}.size());")
 
-    forward_lines.append("        return cur;")
+    body = "\n".join(forward_lines)
 
     return f"""\
 // AUTO-GENERATED by python/sajal_compile.py — do not hand-edit.
-// Generated from an ONNX graph: {' -> '.join(op['op'] for op in ir)}.
+// Generated from an ONNX graph (DAG): {', '.join(f"{op['op']}->{cpp_id(op['output'])}" for op in ir)}.
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -169,7 +196,8 @@ struct CompiledModel {{
 {chr(10).join(member_decls)}
 
     std::vector<float> forward(const std::vector<float>& X, int n) const {{
-{chr(10).join(forward_lines)}
+{body}
+        return {final_output_var};
     }}
 }};
 
@@ -221,7 +249,7 @@ def compile_model(onnx_path, source_artifacts_dir, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     source_artifacts_dir = pathlib.Path(source_artifacts_dir)
 
-    ir, initializers = parse_onnx(onnx_path)
+    ir, initializers, graph_input_name = parse_onnx(onnx_path)
 
     for op in ir:
         if op["op"] in ("linear", "layernorm"):
@@ -238,7 +266,7 @@ def compile_model(onnx_path, source_artifacts_dir, out_dir):
     shutil.copy(source_artifacts_dir / "test_inputs.bin", out_dir / "test_inputs.bin")
     shutil.copy(source_artifacts_dir / "ref_outputs.bin", out_dir / "ref_outputs.bin")
 
-    (out_dir / "model.cpp").write_text(generate_cpp(ir))
+    (out_dir / "model.cpp").write_text(generate_cpp(ir, graph_input_name))
 
     binary_path = out_dir / "model"
     result = subprocess.run(
