@@ -11,3 +11,4 @@ native/bert
 native/lngelu_reference
 native/residual_reference
 native/attention_reference
+native/full_block_reference
