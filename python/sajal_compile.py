@@ -1,4 +1,4 @@
-"""exp15-28: the smallest real ONNX -> native C++ compiler.
+"""exp15-29: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -98,6 +98,23 @@ graph that starts with LayerNorm instead. One gap (Q/K/V from a single
 combined Conv1D via ONNX Split) was named and routed around rather than
 closed, same as exp25's handling of BERT's stray Gather.
 
+exp29: closed exp28's named, deferred gap — Q/K/V from one combined
+projection (GPT-2's real c_attn) split via ONNX Split, rather than three
+dedicated Linears. resolve_split_source resolves any tensor back through
+an optional Split producer to (shared_buffer, column_offset,
+buffer_width), composing with the existing per-head BLAS pointer-offset
+trick (exp20) one level up — (tensor_name, 0, d) unchanged for the
+ordinary case. Getting there took two real bug fixes, not just new
+matching logic: (1) the main loop visits nodes in order and Split always
+precedes the Reshape that triggers the attention match consuming it, so
+it needed an explicit lookahead rather than the usual defer-after-match
+pattern; (2) resolve_dim's fallback and find_producer both looked up a
+tensor's producer via `list(node.output) == [tensor_name]` — a
+single-output assumption that happened to hold for eight prior
+experiments (Gemm/Add/Transpose/Reshape/MatMul/Softmax are all
+single-output) and silently failed the instant a real multi-output node
+(Split) needed to be found. Fixed by switching both to membership.
+
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
 """
@@ -149,6 +166,21 @@ def _constant_value(tensor_name, constants):
     if tensor_name not in constants:
         return None
     return float(np.asarray(constants[tensor_name]).reshape(-1)[0])
+
+
+def _split_sizes(split_node, constants):
+    """The per-output sizes of an ONNX Split node — from its 2nd input
+    (a constant, the newer-opset convention) or its `split` attribute
+    (older opset). Returns None if neither is resolvable (e.g. an even
+    split with no explicit sizes at all), so callers fail cleanly rather
+    than guessing."""
+    inputs = list(split_node.input)
+    if len(inputs) > 1 and inputs[1] in constants:
+        return [int(x) for x in np.asarray(constants[inputs[1]]).reshape(-1)]
+    for a in split_node.attribute:
+        if a.name == "split":
+            return list(a.ints)
+    return None
 
 
 def try_match_decomposed_gelu(nodes, i, constants, tensor_dims):
@@ -550,12 +582,24 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         if tensor_name in tensor_dims:
             return tensor_dims[tensor_name]
         for n in nodes:
-            if list(n.output) != [tensor_name]:
+            if tensor_name not in n.output:  # membership, not equality: Split has 3 outputs
                 continue
             if n.op_type in ("Gemm", "Add"):
                 bias_candidates = [x for x in n.input if x in initializers and initializers[x].ndim == 1]
                 if len(bias_candidates) == 1:
                     return int(initializers[bias_candidates[0]].shape[0])
+            if n.op_type == "Split":
+                # exp29: GPT-2's real combined c_attn projection produces
+                # Q/K/V via one Gemm + Split, not three dedicated Linears —
+                # this tensor's "own" dim is really its slot's split size.
+                sizes = _split_sizes(n, constants)
+                if sizes is not None:
+                    try:
+                        idx = list(n.output).index(tensor_name)
+                    except ValueError:
+                        continue
+                    if idx < len(sizes):
+                        return int(sizes[idx])
         return None
 
     d = resolve_dim(node0.input[0])
@@ -572,9 +616,41 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         node it turns out to be. Every lookup in this function is
         tensor-name-exact, so it never widens to nodes from a different
         attention instance (exp23) or misreads a differently-shaped real
-        export (exp26) as something it isn't."""
-        matches = [(idx, n) for idx, n in enumerate(nodes) if list(n.output) == [tensor_name]]
+        export (exp26) as something it isn't. Membership, not list
+        equality — exp29's Split has 3 outputs, not 1."""
+        matches = [(idx, n) for idx, n in enumerate(nodes) if tensor_name in n.output]
         return matches[0] if len(matches) == 1 else None
+
+    def resolve_split_source(tensor_name):
+        """If tensor_name is one output of an ONNX Split node — GPT-2's
+        real combined c_attn projection producing Q/K/V from one shared
+        buffer via Gemm+Split rather than three dedicated Linears
+        (exp28's named, deferred gap; closed here in exp29) — returns
+        (shared_buffer_tensor, column_offset, buffer_width) so codegen can
+        address this Q/K/V as a column-slice via the same BLAS lda/ldb
+        pointer-offset trick already used for per-head slicing (exp20),
+        one level up: the buffer's full row-stride becomes the GEMM's
+        `lda`, and `column_offset + h*d_head` becomes the per-head pointer
+        offset within it. Otherwise (a dedicated Linear per Q/K/V, every
+        prior experiment) returns (tensor_name, 0, d) — this branch's own
+        buffer, unsliced. Returns (buffer, offset, stride, split_node_idx)
+        — split_node_idx is None in the unsliced case."""
+        producer = find_producer(tensor_name)
+        if producer is None or producer[1].op_type != "Split":
+            return tensor_name, 0, d, None
+        split_idx, split_node = producer
+        sizes = _split_sizes(split_node, constants)
+        if sizes is None:
+            return tensor_name, 0, d, None
+        try:
+            output_index = list(split_node.output).index(tensor_name)
+        except ValueError:
+            return tensor_name, 0, d, None
+        if output_index >= len(sizes):
+            return tensor_name, 0, d, None
+        offset = sum(sizes[:output_index])
+        stride = sum(sizes)
+        return split_node.input[0], offset, stride, split_idx
 
     def perm_of(transpose_node):
         return next((list(a.ints) for a in transpose_node.attribute if a.name == "perm"), None)
@@ -656,8 +732,9 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         role = classify_perm(perm_of(t_node) or [])
         if role is None:
             return None
-        return {"reshape_idx": r_idx, "transpose_idx": t_idx, "role": role,
-                "out": t_node.output[0], "linear": r_node.input[0]}
+        buffer, offset, stride, split_idx = resolve_split_source(r_node.input[0])
+        return {"reshape_idx": r_idx, "transpose_idx": t_idx, "role": role, "out": t_node.output[0],
+                "linear": (buffer, offset, stride), "split_idx": split_idx}
 
     def branch_from_transposed_tensor(tensor_name):
         """Traces backward from a (possibly pre-scaled) Transpose output
@@ -809,9 +886,10 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         return None
 
     branches = (q_branch, k_branch, v_branch)
+    split_indices = {b["split_idx"] for b in branches if b["split_idx"] is not None}
     consumed = {b["reshape_idx"] for b in branches} | {b["transpose_idx"] for b in branches} | {
         mm_pre_idx, softmax_idx, mm_post_idx, final_t_idx, final_r_idx,
-    } | consumed_scale_nodes
+    } | consumed_scale_nodes | split_indices
     ir_entry = {"op": "multihead_self_attention", "q": q_branch["linear"], "k": k_branch["linear"],
                 "v": v_branch["linear"], "num_heads": num_heads, "d_head": d_head,
                 "scale": scale_value, "output": final_r_node.output[0], "dim": d, "causal": causal}
@@ -901,6 +979,39 @@ def parse_onnx(onnx_path):
             ir.append(identity_match)
             i += 1
             continue
+
+        if node.op_type == "Split":
+            # exp29: GPT-2's real combined c_attn projection puts Split
+            # BEFORE the Reshape that actually triggers
+            # try_match_multihead_attention (position-wise, Split's own
+            # index always comes first — it produces the very tensor the
+            # Reshape consumes). The main walk would otherwise reject
+            # Split immediately, never getting the chance to find the
+            # downstream match that consumes it. So: look ahead — does any
+            # of this Split's outputs feed a Reshape whose multi-head
+            # match would claim this very Split node? If so, that match is
+            # resolved right now (same deferred-emission bookkeeping the
+            # natural trigger point would have done) and Split is skipped;
+            # otherwise it falls through to the ordinary unsupported-op
+            # rejection below, same as any other unrecognized Split.
+            resolved = False
+            for out_tensor in node.output:
+                for r_idx, r_node in enumerate(nodes):
+                    if r_node.op_type != "Reshape" or out_tensor not in r_node.input:
+                        continue
+                    mh_match = try_match_multihead_attention(nodes, r_idx, constants, tensor_dims, initializers)
+                    if mh_match is not None and i in mh_match[1]:
+                        ir_entry, consumed = mh_match
+                        emit_at = max(consumed)
+                        consumed_skip |= consumed - {emit_at}
+                        pending_emit[emit_at] = ir_entry
+                        resolved = True
+                        break
+                if resolved:
+                    break
+            if resolved:
+                i += 1
+                continue
 
         if node.op_type not in SUPPORTED_OPS:
             raise UnsupportedGraph(
@@ -1082,26 +1193,37 @@ def generate_cpp(ir, graph_input_name):
                 f"{scores_var}.data(), n, {v_var}.data(), {d}, 0.0f, {out_var}.data(), {d});"
             )
         elif op["op"] == "multihead_self_attention":
-            q_var, k_var, v_var = var(op["q"]), var(op["k"]), var(op["v"])
+            # exp29: q/k/v is (buffer_tensor, column_offset, buffer_width) —
+            # column_offset/buffer_width are (0, d) for a dedicated Linear
+            # per Q/K/V (every prior experiment), or a real slice into a
+            # wider shared buffer when Q/K/V came from one combined
+            # projection (GPT-2's real c_attn, split via ONNX Split).
+            (q_buf, q_off, q_stride) = op["q"]
+            (k_buf, k_off, k_stride) = op["k"]
+            (v_buf, v_off, v_stride) = op["v"]
+            q_var, k_var, v_var = var(q_buf), var(k_buf), var(v_buf)
             d, dh, h_count, scale = op["dim"], op["d_head"], op["num_heads"], op["scale"]
             scores_var = out_var + "_scores"
             # Per-head loop with the same BLAS lda/ldb stride trick as
             # native/transformer_model.hpp: head h's Q/K/V is the column
-            # slice [h*dh, (h+1)*dh) of the full [n,d] buffer, addressed by
-            # pointer offset + full-row stride d — no physical splitting.
+            # slice [h*dh, (h+1)*dh) of the full [n,dim] buffer, addressed by
+            # pointer offset + full-row stride — no physical splitting,
+            # whether that buffer is Q/K/V's own dedicated [n,d] output or
+            # (exp29) a shared [n, 3*d]-or-wider combined-projection buffer.
             forward_lines.append(f"        std::vector<float> {scores_var}(static_cast<size_t>(n) * n);")
             forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {d});")
             forward_lines.append(f"        for (int h = 0; h < {h_count}; ++h) {{")
             forward_lines.append(
                 f"            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, n, {dh}, {scale}f, "
-                f"{q_var}.data() + h * {dh}, {d}, {k_var}.data() + h * {dh}, {d}, 0.0f, {scores_var}.data(), n);"
+                f"{q_var}.data() + {q_off} + h * {dh}, {q_stride}, "
+                f"{k_var}.data() + {k_off} + h * {dh}, {k_stride}, 0.0f, {scores_var}.data(), n);"
             )
             if op.get("causal"):
                 forward_lines.append(f"            causal_mask_rows({scores_var}.data(), n);")
             forward_lines.append(f"            softmax_rows({scores_var}.data(), n, n);")
             forward_lines.append(
                 f"            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, {dh}, n, 1.0f, "
-                f"{scores_var}.data(), n, {v_var}.data() + h * {dh}, {d}, 0.0f, {out_var}.data() + h * {dh}, {d});"
+                f"{scores_var}.data(), n, {v_var}.data() + {v_off} + h * {dh}, {v_stride}, 0.0f, {out_var}.data() + h * {dh}, {d});"
             )
             forward_lines.append("        }")
 
