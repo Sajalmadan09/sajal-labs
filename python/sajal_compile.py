@@ -1,4 +1,4 @@
-"""exp15-29: the smallest real ONNX -> native C++ compiler.
+"""exp15-30: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -114,6 +114,23 @@ single-output assumption that happened to hold for eight prior
 experiments (Gemm/Add/Transpose/Reshape/MatMul/Softmax are all
 single-output) and silently failed the instant a real multi-output node
 (Split) needed to be found. Fixed by switching both to membership.
+
+exp30: closed the other gap exp28 named and deferred — GPT-2's own
+causal mask, which decomposes as Equal+Where+Add (additive bias) with
+Trilu's `upper` attribute explicitly 0 (not the ONNX-spec default of 1),
+not exp27's Cast+Where (direct select, default upper). Getting the
+polarity right took checking (an empirical PyTorch comparison, then
+extracting Trilu's actual runtime output via onnxruntime), not just
+deriving — a first by-hand derivation assuming the default upper value
+was silently backwards. _causal_bool_condition now reads upper/k directly
+and computes the net masked condition symbolically instead of assuming
+either. Getting real GPT-2's trace to actually compile after that
+surfaced two more real bugs: K's own head-split Reshape has TWO
+Transpose consumers in this real export (branch_from_reshape had always
+assumed exactly one), and the mask's dynamic-shape bookkeeping subgraph
+(Shape/Slice/Concat feeding Expand) needed explicit marking as consumed
+dead weight rather than being left for the main walk to reject. Real
+GPT-2, traced directly with zero rewiring, now compiles.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -379,85 +396,208 @@ def try_match_matmul_add_linear(nodes, i, initializer_names, initializers):
             "weight_transposed": True}, i + 2
 
 
-def _validate_causal_mask(nodes, constants, where_node):
-    """Shared content-check for a `Trilu(ones,k=1) -> Cast -> Where(mask,
-    -inf, scores)` triple, given the Where node — PyTorch's export of
-    `scores.masked_fill(causal_mask, -inf)` for a standard strict
-    upper-triangular (autoregressive) mask: row i attends to columns <= i
-    only. Only that exact shape/fill-value/diagonal-offset is recognized;
-    any other masking scheme falls through to this compiler's normal
-    "unsupported op" rejection rather than being silently mishandled.
-    Returns (pre_mask_tensor, consumed_indices_excluding_where) or None."""
-    mask_in, true_in, false_in = where_node.input
-    if true_in not in constants:
+def _consume_shape_bookkeeping_chain(nodes, tensor_name):
+    """Walks backward from tensor_name through Shape/Slice/Concat nodes —
+    pure shape bookkeeping, no numeric contribution — collecting their
+    indices. Stops (without marking anything) the moment it hits any
+    other op, so a still-needed real tensor feeding into this chain (e.g.
+    Q's own Transpose output, whose *shape* — not value — is used to
+    build the mask's dynamic Expand shape in exp30's real GPT-2 export)
+    is correctly left alone rather than mistaken for part of the chain."""
+    consumed = set()
+    frontier = [tensor_name]
+    seen = set()
+    while frontier:
+        t = frontier.pop()
+        if t in seen:
+            continue
+        seen.add(t)
+        producer = next(((idx, n) for idx, n in enumerate(nodes) if t in n.output), None)
+        if producer is None:
+            continue
+        idx, node = producer
+        if node.op_type not in ("Shape", "Slice", "Concat"):
+            continue
+        consumed.add(idx)
+        frontier.extend(node.input)
+    return consumed
+
+
+def _resolve_trilu_ones_source(nodes, constants, tensor_name):
+    """tensor_name should be Trilu's first input (an all-ones matrix).
+    Accepts either a literal Constant (exp27's synthetic models) or
+    `Expand(1.0-scalar, dynamic_shape)` (exp30 — GPT-2's real export
+    computes the mask's shape at runtime from Q/K's own shapes via
+    Shape/Slice/Concat, but `Expand(1.0, anything)` is unconditionally
+    all-ones regardless of that shape, so the dynamic part needs no
+    validation of its own — just marking as consumed, since it's
+    otherwise an orphaned dead end this compiler doesn't compute at
+    runtime anyway (n is already a parameter)). Returns
+    (is_valid, consumed_indices)."""
+    if tensor_name in constants:
+        arr = np.asarray(constants[tensor_name])
+        valid = arr.ndim >= 2 and arr.shape[-1] == arr.shape[-2] and bool(np.all(arr == 1))
+        return valid, set()
+    producer = next(((idx, n) for idx, n in enumerate(nodes) if tensor_name in n.output), None)
+    if producer is None or producer[1].op_type != "Expand":
+        return False, set()
+    expand_idx, expand_node = producer
+    scalar_in, shape_in = expand_node.input[0], expand_node.input[1]
+    val = _constant_value(scalar_in, constants)
+    if val != 1.0:
+        return False, set()
+    consumed = {expand_idx} | _consume_shape_bookkeeping_chain(nodes, shape_in)
+    return True, consumed
+
+
+def _causal_bool_condition(nodes, constants, bool_tensor):
+    """Given the tensor feeding a Where's mask input, traces backward
+    through an optional boolify step — `Cast` (direct pass-through,
+    exp27's synthetic models) or `Equal(x, 0.0)` (inverted: true where
+    Trilu's output is 0 — exp30, GPT-2's real export) — to a `Trilu`
+    node, and determines whether the combination amounts to exactly the
+    standard causal condition (row i attends to columns <= i; column > i
+    masked). `Trilu`'s own `upper` attribute (default 1, but exp30 found
+    GPT-2's real export sets it to 0 explicitly — verified by extracting
+    this node's actual runtime output via onnxruntime, not assumed from
+    the ONNX spec's default alone) and `k` (its 2nd input if present,
+    else default 0) are both read directly rather than assumed, so this
+    recognizes whichever concrete (upper, k, inverted) combination a real
+    exporter happens to produce, as long as the NET effect is the
+    standard mask. Returns consumed_indices (the boolify and Trilu node
+    indices) if so, else None."""
+    producer = next(((idx, n) for idx, n in enumerate(nodes) if list(n.output) == [bool_tensor]), None)
+    if producer is None:
         return None
-    fill_val = float(np.asarray(constants[true_in]).reshape(-1)[0])
-    if not (math.isinf(fill_val) and fill_val < 0):
+    b_idx, b_node = producer
+    if b_node.op_type == "Cast":
+        trilu_tensor = b_node.input[0]
+        inverted = False
+    elif b_node.op_type == "Equal":
+        zero_candidates = [x for x in b_node.input if _constant_value(x, constants) == 0.0]
+        other_candidates = [x for x in b_node.input if x not in zero_candidates]
+        if len(zero_candidates) != 1 or len(other_candidates) != 1:
+            return None
+        trilu_tensor = other_candidates[0]
+        inverted = True
+    else:
         return None
 
-    cast_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "Cast" and list(n.output) == [mask_in]]
-    if len(cast_matches) != 1:
+    trilu_producer = next(((idx, n) for idx, n in enumerate(nodes) if list(n.output) == [trilu_tensor]), None)
+    if trilu_producer is None or trilu_producer[1].op_type != "Trilu":
         return None
-    cast_idx, cast_node = cast_matches[0]
+    trilu_idx, trilu_node = trilu_producer
+    ones_valid, ones_consumed = _resolve_trilu_ones_source(nodes, constants, trilu_node.input[0])
+    if not ones_valid:
+        return None
 
-    trilu_matches = [(idx, n) for idx, n in enumerate(nodes)
-                      if n.op_type == "Trilu" and list(n.output) == [cast_node.input[0]]]
-    if len(trilu_matches) != 1:
-        return None
-    trilu_idx, trilu_node = trilu_matches[0]
-    if trilu_node.input[0] not in constants:
-        return None
-    ones_arr = np.asarray(constants[trilu_node.input[0]])
-    if ones_arr.ndim < 2 or ones_arr.shape[-1] != ones_arr.shape[-2] or not np.all(ones_arr == 1):
-        return None
-    k_val = 1
+    upper = 1
+    for a in trilu_node.attribute:
+        if a.name == "upper":
+            upper = a.i
+    k_val = 0
     if len(trilu_node.input) > 1 and trilu_node.input[1] in constants:
         k_val = int(np.asarray(constants[trilu_node.input[1]]).reshape(-1)[0])
-    if k_val != 1:
-        return None  # only the standard strict-upper-triangular causal mask is recognized
+    base_cond = ("ge", k_val) if upper else ("le", k_val)  # Trilu==1 iff j>=i+k (upper) or j<=i+k
 
-    return false_in, {cast_idx, trilu_idx}
+    if not inverted:
+        final_cond = base_cond
+    else:
+        cmp, kk = base_cond  # NOT(j>=i+k) == j<=i+k-1 ; NOT(j<=i+k) == j>=i+k+1
+        final_cond = ("le", kk - 1) if cmp == "ge" else ("ge", kk + 1)
+
+    if final_cond != ("ge", 1):  # must reduce to exactly j > i (strict future masked)
+        return None
+    return {b_idx, trilu_idx} | ones_consumed
+
+
+def _try_where_as_causal(nodes, constants, where_node):
+    """where_node's own 3 inputs are (mask, true_value, false_value).
+    Requires true_value to be -inf; the mask condition itself is checked
+    by _causal_bool_condition. Returns consumed_indices or None."""
+    if len(where_node.input) != 3:
+        return None
+    mask_in, true_in, _ = where_node.input
+    fill_val = _constant_value(true_in, constants)
+    if fill_val is None or not (math.isinf(fill_val) and fill_val < 0):
+        return None
+    return _causal_bool_condition(nodes, constants, mask_in)
 
 
 def try_match_causal_mask(nodes, constants, scores_tensor):
-    """Forward variant: finds a causal mask applied TO scores_tensor (its
-    unique Where-consumer, with scores_tensor as the false-branch). Used
-    by try_match_self_attention and try_match_multihead_attention's
-    Q/K-triggered branch, where the caller already has the pre-mask
-    tensor and needs to find what (if anything) sits between it and
-    softmax. Returns (masked_tensor, consumed_indices) or None — no mask
-    present, scores_tensor feeds softmax directly (exp15-26's existing
-    behavior, unchanged)."""
-    where_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "Where" and scores_tensor in n.input]
-    if len(where_matches) != 1:
-        return None
-    where_idx, where_node = where_matches[0]
-    if where_node.input[2] != scores_tensor:
-        return None
-    result = _validate_causal_mask(nodes, constants, where_node)
-    if result is None:
-        return None
-    _, consumed = result
-    return where_node.output[0], consumed | {where_idx}
+    """Forward variant: does scores_tensor get causally masked before
+    reaching softmax? Two recognized shapes: (a) `Where(mask, -inf,
+    scores_tensor)` directly, scores_tensor as the false-branch (exp27's
+    synthetic models); or (b) `Where(mask, -inf, 0.0) -> mask_bias`,
+    `Add(scores_tensor, mask_bias)` — an ADDITIVE bias combined
+    separately rather than selected directly (exp30 — GPT-2's real
+    export). Used by try_match_self_attention and
+    try_match_multihead_attention's Q/K-triggered branch, where the
+    caller already has the pre-mask tensor and needs to find what (if
+    anything) sits between it and softmax. Returns
+    (masked_tensor, consumed_indices) or None — no mask present,
+    scores_tensor feeds softmax directly (exp15-26's existing behavior,
+    unchanged)."""
+    for where_idx, where_node in ((idx, n) for idx, n in enumerate(nodes) if n.op_type == "Where"):
+        if len(where_node.input) == 3 and where_node.input[2] == scores_tensor:
+            consumed = _try_where_as_causal(nodes, constants, where_node)
+            if consumed is not None:
+                return where_node.output[0], consumed | {where_idx}
+
+    for add_idx, add_node in ((idx, n) for idx, n in enumerate(nodes) if n.op_type == "Add" and scores_tensor in n.input):
+        other = [x for x in add_node.input if x != scores_tensor]
+        if len(other) != 1:
+            continue
+        where_producer = next(
+            ((idx, n) for idx, n in enumerate(nodes) if list(n.output) == [other[0]] and n.op_type == "Where"), None)
+        if where_producer is None:
+            continue
+        where_idx, where_node = where_producer
+        if len(where_node.input) != 3 or _constant_value(where_node.input[2], constants) != 0.0:
+            continue
+        consumed = _try_where_as_causal(nodes, constants, where_node)
+        if consumed is not None:
+            return add_node.output[0], consumed | {where_idx, add_idx}
+    return None
 
 
 def unwrap_causal_mask_backward(nodes, constants, tensor_name):
-    """Backward variant: if tensor_name is itself a causal-mask Where
-    node's output, unwraps to the tensor it masked. Used by
+    """Backward variant: if tensor_name is itself a masked-scores tensor
+    (either combine style from try_match_causal_mask's docstring),
+    unwraps to the pre-mask scores tensor. Used by
     try_match_multihead_attention's V-triggered branch, where the caller
     is tracing backward from softmax's input and needs to see past an
     optional mask to reach the pre-softmax MatMul. Returns
     (tensor_name_or_unwrapped, consumed_indices) — consumed_indices is
     empty when there's no mask to unwrap."""
-    where_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "Where" and list(n.output) == [tensor_name]]
-    if len(where_matches) != 1:
+    producer = next(((idx, n) for idx, n in enumerate(nodes) if list(n.output) == [tensor_name]), None)
+    if producer is None:
         return tensor_name, set()
-    where_idx, where_node = where_matches[0]
-    result = _validate_causal_mask(nodes, constants, where_node)
-    if result is None:
+    p_idx, p_node = producer
+
+    if p_node.op_type == "Where":
+        consumed = _try_where_as_causal(nodes, constants, p_node)
+        if consumed is not None:
+            return p_node.input[2], consumed | {p_idx}
         return tensor_name, set()
-    pre_mask_tensor, consumed = result
-    return pre_mask_tensor, consumed | {where_idx}
+
+    if p_node.op_type == "Add" and len(p_node.input) == 2:
+        add_inputs = list(p_node.input)
+        for scores_candidate, mask_candidate in (add_inputs, list(reversed(add_inputs))):
+            where_producer = next(
+                ((idx, n) for idx, n in enumerate(nodes) if list(n.output) == [mask_candidate] and n.op_type == "Where"),
+                None)
+            if where_producer is None:
+                continue
+            where_idx, where_node = where_producer
+            if len(where_node.input) != 3 or _constant_value(where_node.input[2], constants) != 0.0:
+                continue
+            consumed = _try_where_as_causal(nodes, constants, where_node)
+            if consumed is not None:
+                return scores_candidate, consumed | {where_idx, p_idx}
+        return tensor_name, set()
+
+    return tensor_name, set()
 
 
 def try_match_self_attention(nodes, i, constants, tensor_dims):
@@ -717,24 +857,60 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
                 continue
             return tensor_or_final, total_scale, producer, consumed_here
 
-    def branch_from_reshape(r_idx, r_node):
+    def branch_from_reshape(r_idx, r_node, prefer_transpose_idx=None):
         """(Reshape, Transpose) pair starting at r_node — verifies shape/dim
-        match and returns the branch dict, or None."""
+        match and returns the branch dict, or None.
+
+        exp30: GPT-2's real export gives K's head-split Reshape TWO
+        Transpose consumers, not one — the real K^T used in the attention
+        matmul, plus a second "throwaway" transpose (same tensor, a
+        different perm) that only feeds the causal mask's dynamic-shape
+        computation (Shape->Slice->Concat->Expand->Trilu), never the
+        actual attention math. Both can look like valid branches to
+        classify_perm (they're just different roles), so when there's
+        more than one candidate, this prefers whichever one is actually
+        consumed (directly, or through an optional scale-wrap) by a
+        MatMul — the throwaway one never is. If prefer_transpose_idx is
+        given (the caller already knows exactly which Transpose it wants,
+        from tracing backward in branch_from_transposed_tensor), that one
+        is required instead of guessing."""
         if r_node.input[1] not in constants:
             return None
         shape = [int(x) for x in np.asarray(constants[r_node.input[1]]).reshape(-1)]
         if shape != shape0 or resolve_dim(r_node.input[0]) != d:
             return None
-        consumers = find_consumers(r_node.output[0], "Transpose")
-        if len(consumers) != 1:
+        all_candidates = []
+        for t_idx, t_node in find_consumers(r_node.output[0], "Transpose"):
+            role = classify_perm(perm_of(t_node) or [])
+            if role is not None:
+                all_candidates.append((t_idx, t_node, role))
+        if not all_candidates:
             return None
-        t_idx, t_node = consumers[0]
-        role = classify_perm(perm_of(t_node) or [])
-        if role is None:
-            return None
+        if prefer_transpose_idx is not None:
+            chosen = next((c for c in all_candidates if c[0] == prefer_transpose_idx), None)
+            if chosen is None:
+                return None
+        elif len(all_candidates) == 1:
+            chosen = all_candidates[0]
+        else:
+            chosen = None
+            for candidate in all_candidates:
+                probe_tensor, _, _ = unwrap_scale_forward(candidate[1].output[0])
+                if find_consumers(probe_tensor, "MatMul"):
+                    chosen = candidate
+                    break
+            if chosen is None:
+                return None
+        t_idx, t_node, role = chosen
+        # exp30: any OTHER valid-looking candidate not chosen (the
+        # throwaway transpose, when there was one) is an otherwise-orphaned
+        # node this compiler never computes anything with — the caller
+        # must still mark it consumed so the main walk doesn't later reject
+        # it as an unrecognized standalone Transpose.
+        extra_consumed = {c[0] for c in all_candidates if c[0] != t_idx}
         buffer, offset, stride, split_idx = resolve_split_source(r_node.input[0])
         return {"reshape_idx": r_idx, "transpose_idx": t_idx, "role": role, "out": t_node.output[0],
-                "linear": (buffer, offset, stride), "split_idx": split_idx}
+                "linear": (buffer, offset, stride), "split_idx": split_idx, "extra_consumed": extra_consumed}
 
     def branch_from_transposed_tensor(tensor_name):
         """Traces backward from a (possibly pre-scaled) Transpose output
@@ -751,8 +927,8 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         if r_producer is None or r_producer[1].op_type != "Reshape":
             return None
         r_idx, r_node = r_producer
-        branch = branch_from_reshape(r_idx, r_node)
-        if branch is None or branch["transpose_idx"] != t_idx:
+        branch = branch_from_reshape(r_idx, r_node, prefer_transpose_idx=t_idx)
+        if branch is None:
             return None
         return branch, scale, consumed_here
 
@@ -887,9 +1063,10 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
 
     branches = (q_branch, k_branch, v_branch)
     split_indices = {b["split_idx"] for b in branches if b["split_idx"] is not None}
+    extra_transpose_indices = set().union(*(b["extra_consumed"] for b in branches))
     consumed = {b["reshape_idx"] for b in branches} | {b["transpose_idx"] for b in branches} | {
         mm_pre_idx, softmax_idx, mm_post_idx, final_t_idx, final_r_idx,
-    } | consumed_scale_nodes | split_indices
+    } | consumed_scale_nodes | split_indices | extra_transpose_indices
     ir_entry = {"op": "multihead_self_attention", "q": q_branch["linear"], "k": k_branch["linear"],
                 "v": v_branch["linear"], "num_heads": num_heads, "d_head": d_head,
                 "scale": scale_value, "output": final_r_node.output[0], "dim": d, "causal": causal}
