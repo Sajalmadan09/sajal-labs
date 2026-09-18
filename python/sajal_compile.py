@@ -1,4 +1,4 @@
-"""exp15-26: the smallest real ONNX -> native C++ compiler.
+"""exp15-27: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -70,6 +70,15 @@ exp26/results.md) — traced to combining two independently-rounded scale
 factors via Python float multiplication, not a bug: the exact IEEE-754
 non-associativity caveat this project's methodology has named since exp1,
 finally encountered in practice.
+
+exp27: causal (autoregressive) attention masking — recognizes PyTorch's
+standard `scores.masked_fill(causal_mask, -inf)` export
+(`Trilu(ones,k=1)->Cast->Where`) sitting between the scale step and
+Softmax in both try_match_self_attention and
+try_match_multihead_attention. A modifier on the existing attention IR
+ops (`causal: bool`), not a new op — codegen just runs
+common.hpp's causal_mask_rows() before softmax_rows(), reusing that its
+-inf entries already drop out of softmax's row sum correctly.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -220,16 +229,98 @@ def try_match_matmul_add_linear(nodes, i, initializer_names, initializers):
             "weight_transposed": True}, i + 2
 
 
-def try_match_self_attention(nodes, i, constants, tensor_dims):
-    """Looks for exactly: Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul(scale)
-    -> Softmax -> MatMul(attn,V), starting at nodes[i]. Returns
-    (ir_entry, next_index) or None — a pattern match, not general MatMul/
-    Transpose support; anything not shaped exactly like this falls through
-    to the caller's normal per-node handling (which will reject Transpose/
-    MatMul as unsupported op types on their own)."""
-    if i + 4 >= len(nodes):
+def _validate_causal_mask(nodes, constants, where_node):
+    """Shared content-check for a `Trilu(ones,k=1) -> Cast -> Where(mask,
+    -inf, scores)` triple, given the Where node — PyTorch's export of
+    `scores.masked_fill(causal_mask, -inf)` for a standard strict
+    upper-triangular (autoregressive) mask: row i attends to columns <= i
+    only. Only that exact shape/fill-value/diagonal-offset is recognized;
+    any other masking scheme falls through to this compiler's normal
+    "unsupported op" rejection rather than being silently mishandled.
+    Returns (pre_mask_tensor, consumed_indices_excluding_where) or None."""
+    mask_in, true_in, false_in = where_node.input
+    if true_in not in constants:
         return None
-    n0, n1, n2, n3, n4 = nodes[i:i + 5]
+    fill_val = float(np.asarray(constants[true_in]).reshape(-1)[0])
+    if not (math.isinf(fill_val) and fill_val < 0):
+        return None
+
+    cast_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "Cast" and list(n.output) == [mask_in]]
+    if len(cast_matches) != 1:
+        return None
+    cast_idx, cast_node = cast_matches[0]
+
+    trilu_matches = [(idx, n) for idx, n in enumerate(nodes)
+                      if n.op_type == "Trilu" and list(n.output) == [cast_node.input[0]]]
+    if len(trilu_matches) != 1:
+        return None
+    trilu_idx, trilu_node = trilu_matches[0]
+    if trilu_node.input[0] not in constants:
+        return None
+    ones_arr = np.asarray(constants[trilu_node.input[0]])
+    if ones_arr.ndim < 2 or ones_arr.shape[-1] != ones_arr.shape[-2] or not np.all(ones_arr == 1):
+        return None
+    k_val = 1
+    if len(trilu_node.input) > 1 and trilu_node.input[1] in constants:
+        k_val = int(np.asarray(constants[trilu_node.input[1]]).reshape(-1)[0])
+    if k_val != 1:
+        return None  # only the standard strict-upper-triangular causal mask is recognized
+
+    return false_in, {cast_idx, trilu_idx}
+
+
+def try_match_causal_mask(nodes, constants, scores_tensor):
+    """Forward variant: finds a causal mask applied TO scores_tensor (its
+    unique Where-consumer, with scores_tensor as the false-branch). Used
+    by try_match_self_attention and try_match_multihead_attention's
+    Q/K-triggered branch, where the caller already has the pre-mask
+    tensor and needs to find what (if anything) sits between it and
+    softmax. Returns (masked_tensor, consumed_indices) or None — no mask
+    present, scores_tensor feeds softmax directly (exp15-26's existing
+    behavior, unchanged)."""
+    where_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "Where" and scores_tensor in n.input]
+    if len(where_matches) != 1:
+        return None
+    where_idx, where_node = where_matches[0]
+    if where_node.input[2] != scores_tensor:
+        return None
+    result = _validate_causal_mask(nodes, constants, where_node)
+    if result is None:
+        return None
+    _, consumed = result
+    return where_node.output[0], consumed | {where_idx}
+
+
+def unwrap_causal_mask_backward(nodes, constants, tensor_name):
+    """Backward variant: if tensor_name is itself a causal-mask Where
+    node's output, unwraps to the tensor it masked. Used by
+    try_match_multihead_attention's V-triggered branch, where the caller
+    is tracing backward from softmax's input and needs to see past an
+    optional mask to reach the pre-softmax MatMul. Returns
+    (tensor_name_or_unwrapped, consumed_indices) — consumed_indices is
+    empty when there's no mask to unwrap."""
+    where_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "Where" and list(n.output) == [tensor_name]]
+    if len(where_matches) != 1:
+        return tensor_name, set()
+    where_idx, where_node = where_matches[0]
+    result = _validate_causal_mask(nodes, constants, where_node)
+    if result is None:
+        return tensor_name, set()
+    pre_mask_tensor, consumed = result
+    return pre_mask_tensor, consumed | {where_idx}
+
+
+def try_match_self_attention(nodes, i, constants, tensor_dims):
+    """Looks for: Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul/Div(scale) ->
+    [optional causal mask] -> Softmax -> MatMul(attn,V), starting at
+    nodes[i]. Returns (ir_entry, next_index) or None — a pattern match,
+    not general MatMul/Transpose support; anything not shaped exactly
+    like this falls through to the caller's normal per-node handling
+    (which will reject Transpose/MatMul as unsupported op types on their
+    own)."""
+    if i + 2 >= len(nodes):
+        return None
+    n0, n1, n2 = nodes[i], nodes[i + 1], nodes[i + 2]
 
     if n0.op_type != "Transpose":
         return None
@@ -250,13 +341,22 @@ def try_match_self_attention(nodes, i, constants, tensor_dims):
         return None
     scale_value, scaled_tensor = scale_match
 
-    if n3.op_type != "Softmax" or list(n3.input) != [scaled_tensor]:
-        return None
-    attn_tensor = n3.output[0]
+    mask_match = try_match_causal_mask(nodes, constants, scaled_tensor)
+    causal = mask_match is not None
+    softmax_input, consumed_mask = mask_match if causal else (scaled_tensor, set())
 
-    if n4.op_type != "MatMul" or attn_tensor not in n4.input:
+    softmax_matches = [(idx, n) for idx, n in enumerate(nodes)
+                        if n.op_type == "Softmax" and list(n.input) == [softmax_input]]
+    if len(softmax_matches) != 1:
         return None
-    v_candidates = [x for x in n4.input if x != attn_tensor]
+    softmax_idx, softmax_node = softmax_matches[0]
+    attn_tensor = softmax_node.output[0]
+
+    mm2_matches = [(idx, n) for idx, n in enumerate(nodes) if n.op_type == "MatMul" and attn_tensor in n.input]
+    if len(mm2_matches) != 1:
+        return None
+    mm2_idx, mm2_node = mm2_matches[0]
+    v_candidates = [x for x in mm2_node.input if x != attn_tensor]
     if len(v_candidates) != 1:
         return None
     v_tensor = v_candidates[0]
@@ -267,9 +367,10 @@ def try_match_self_attention(nodes, i, constants, tensor_dims):
     if tensor_dims[k_tensor] != d or tensor_dims[v_tensor] != d:
         return None
 
+    consumed = {i, i + 1, i + 2, softmax_idx, mm2_idx} | consumed_mask
     ir_entry = {"op": "self_attention", "q": q_tensor, "k": k_tensor, "v": v_tensor,
-                "scale": scale_value, "output": n4.output[0], "dim": d}
-    return ir_entry, i + 5
+                "scale": scale_value, "output": mm2_node.output[0], "dim": d, "causal": causal}
+    return ir_entry, max(consumed) + 1
 
 
 def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers):
@@ -493,7 +594,11 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         mm_post_idx, mm_post_node = mm_a_idx, mm_a_node
         softmax_idx, softmax_node = other_producer
 
-        mm_pre_result = resolve_backward(softmax_node.input[0])
+        pre_softmax_tensor, mask_consumed = unwrap_causal_mask_backward(nodes, constants, softmax_node.input[0])
+        causal = bool(mask_consumed)
+        consumed_scale_nodes |= mask_consumed
+
+        mm_pre_result = resolve_backward(pre_softmax_tensor)
         if mm_pre_result is None:
             return None
         mm_pre_tensor, mm_pre_scale, mm_pre_producer, mm_pre_consumed = mm_pre_result
@@ -540,7 +645,12 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         if post_scale_idx is not None:
             consumed_scale_nodes.add(post_scale_idx)
 
-        softmax_matches = find_consumers(post_scale_tensor, "Softmax")
+        mask_match = try_match_causal_mask(nodes, constants, post_scale_tensor)
+        causal = mask_match is not None
+        softmax_input, mask_consumed = mask_match if causal else (post_scale_tensor, set())
+        consumed_scale_nodes |= mask_consumed
+
+        softmax_matches = find_consumers(softmax_input, "Softmax")
         if len(softmax_matches) != 1:
             return None
         softmax_idx, softmax_node = softmax_matches[0]
@@ -588,7 +698,7 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
     } | consumed_scale_nodes
     ir_entry = {"op": "multihead_self_attention", "q": q_branch["linear"], "k": k_branch["linear"],
                 "v": v_branch["linear"], "num_heads": num_heads, "d_head": d_head,
-                "scale": scale_value, "output": final_r_node.output[0], "dim": d}
+                "scale": scale_value, "output": final_r_node.output[0], "dim": d, "causal": causal}
     return ir_entry, consumed
 
 
@@ -794,6 +904,8 @@ def generate_cpp(ir, graph_input_name):
                 f"        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, n, {d}, {scale}f, "
                 f"{q_var}.data(), {d}, {k_var}.data(), {d}, 0.0f, {scores_var}.data(), n);"
             )
+            if op.get("causal"):
+                forward_lines.append(f"        causal_mask_rows({scores_var}.data(), n);")
             forward_lines.append(f"        softmax_rows({scores_var}.data(), n, n);")
             forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {d});")
             forward_lines.append(
@@ -815,6 +927,8 @@ def generate_cpp(ir, graph_input_name):
                 f"            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, n, {dh}, {scale}f, "
                 f"{q_var}.data() + h * {dh}, {d}, {k_var}.data() + h * {dh}, {d}, 0.0f, {scores_var}.data(), n);"
             )
+            if op.get("causal"):
+                forward_lines.append(f"            causal_mask_rows({scores_var}.data(), n);")
             forward_lines.append(f"            softmax_rows({scores_var}.data(), n, n);")
             forward_lines.append(
                 f"            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, {dh}, n, 1.0f, "

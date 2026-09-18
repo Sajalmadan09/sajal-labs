@@ -81,6 +81,16 @@ inline void add_inplace(float* dst, const float* src, size_t n) {
     for (size_t i = 0; i < n; ++i) dst[i] += src[i];
 }
 
+// exp27: standard autoregressive (strict upper-triangular) causal mask —
+// row i may only attend to columns <= i. Applied to raw attention scores
+// BEFORE softmax_rows(), same as PyTorch's `scores.masked_fill(mask,
+// -inf)`: softmax_rows already handles -inf entries correctly (they exp()
+// to 0 and drop out of the row sum), so this needs no softmax changes.
+inline void causal_mask_rows(float* scores, int n) {
+    for (int i = 0; i < n; ++i)
+        for (int j = i + 1; j < n; ++j) scores[static_cast<size_t>(i) * n + j] = -INFINITY;
+}
+
 // Multi-head self-attention computed WITHOUT calling into cblas_sgemm.
 // exp5 (research/experiments/exp5-gemm-dispatch-overhead/results.md) found
 // Accelerate's per-cblas_sgemm-call dispatch cost dominates at exactly this
