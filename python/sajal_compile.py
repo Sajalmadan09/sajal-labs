@@ -1,4 +1,4 @@
-"""exp15-27: the smallest real ONNX -> native C++ compiler.
+"""exp15-28: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -79,6 +79,24 @@ try_match_multihead_attention. A modifier on the existing attention IR
 ops (`causal: bool`), not a new op — codegen just runs
 common.hpp's causal_mask_rows() before softmax_rows(), reusing that its
 -inf entries already drop out of softmax's row sum correctly.
+
+exp28: a real GPT-2 decoder block surfaced six differences from every
+encoder model tried through exp27. Three closed directly:
+try_match_identity_reshape (Conv1D's flatten/unflatten Reshape wrapping —
+a no-op under this project's batch=1 convention), Gemm transB=0 support
+(Conv1D's weight stored [in,out], reusing exp26's weight_transposed
+mechanism), and gelu_tanh as a genuinely SEPARATE IR op/C++ primitive
+from exact "gelu" (GPT-2's "gelu_new" activation is different math, not
+a different encoding of the same math — conflating them would have been
+a silent correctness bug). Two turned out to need nothing beyond a
+one-line dimension-bookkeeping fix: pre-norm ordering (LayerNorm before
+the sub-block) exposed that LayerNormalization's handler never recorded
+its OWN input's dim (only its output's) — every prior model was
+post-norm, where some earlier Linear had always already recorded it —
+and the "graph must start with Linear" check was simply too strict for a
+graph that starts with LayerNorm instead. One gap (Q/K/V from a single
+combined Conv1D via ONNX Split) was named and routed around rather than
+closed, same as exp25's handling of BERT's stray Gather.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -183,6 +201,106 @@ def try_match_decomposed_gelu(nodes, i, constants, tensor_dims):
     if x_tensor not in tensor_dims:
         return None
     return {"op": "gelu", "output": n4.output[0], "input": x_tensor, "dim": tensor_dims[x_tensor]}, i + 5
+
+
+def try_match_tanh_gelu(nodes, i, constants, tensor_dims):
+    """Matches the 8-node "gelu_new" (tanh-approximation) GELU GPT-2's own
+    code uses (transformers.activations.NewGELUActivation), a DIFFERENT
+    decomposition from try_match_decomposed_gelu's exact/erf formula:
+    `0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))` as
+    `Mul(x,0.5) ; Pow(x,3) ; Mul(·,0.044715) ; Add(x,·) ; Mul(·,sqrt(2/pi))
+    ; Tanh ; Add(·,1) ; Mul(half_x,·)`. Strictly sequential (like
+    try_match_decomposed_gelu), so positional lookahead is safe here too.
+    Returns (ir_entry, next_index) or None."""
+    if i + 7 >= len(nodes):
+        return None
+    n0, n1, n2, n3, n4, n5, n6, n7 = nodes[i:i + 8]
+
+    if n0.op_type != "Mul":
+        return None
+    x_candidates = [t for t in n0.input if t not in constants]
+    if len(x_candidates) != 1:
+        return None
+    x_tensor = x_candidates[0]
+    c0 = _constant_value([t for t in n0.input if t != x_tensor][0], constants)
+    if c0 is None or not math.isclose(c0, 0.5, rel_tol=1e-4):
+        return None
+    half_x = n0.output[0]
+
+    if n1.op_type != "Pow" or list(n1.input)[0] != x_tensor:
+        return None
+    c1 = _constant_value(n1.input[1], constants)
+    if c1 is None or not math.isclose(c1, 3.0, rel_tol=1e-4):
+        return None
+
+    if n2.op_type != "Mul" or n1.output[0] not in n2.input:
+        return None
+    c2_candidates = [t for t in n2.input if t != n1.output[0]]
+    if len(c2_candidates) != 1:
+        return None
+    c2 = _constant_value(c2_candidates[0], constants)
+    if c2 is None or not math.isclose(c2, 0.044715, rel_tol=1e-3):
+        return None
+
+    if n3.op_type != "Add" or sorted(n3.input) != sorted([x_tensor, n2.output[0]]):
+        return None
+
+    if n4.op_type != "Mul" or n3.output[0] not in n4.input:
+        return None
+    c4_candidates = [t for t in n4.input if t != n3.output[0]]
+    if len(c4_candidates) != 1:
+        return None
+    c4 = _constant_value(c4_candidates[0], constants)
+    if c4 is None or not math.isclose(c4, math.sqrt(2.0 / math.pi), rel_tol=1e-4):
+        return None
+
+    if n5.op_type != "Tanh" or list(n5.input) != [n4.output[0]]:
+        return None
+
+    if n6.op_type != "Add" or n5.output[0] not in n6.input:
+        return None
+    c6_candidates = [t for t in n6.input if t != n5.output[0]]
+    if len(c6_candidates) != 1:
+        return None
+    c6 = _constant_value(c6_candidates[0], constants)
+    if c6 is None or not math.isclose(c6, 1.0, rel_tol=1e-4):
+        return None
+
+    if n7.op_type != "Mul" or sorted(n7.input) != sorted([half_x, n6.output[0]]):
+        return None
+
+    if x_tensor not in tensor_dims:
+        return None
+    return {"op": "gelu_tanh", "output": n7.output[0], "input": x_tensor, "dim": tensor_dims[x_tensor]}, i + 8
+
+
+def try_match_identity_reshape(node, constants, tensor_dims):
+    """Recognizes a Reshape that only adds or removes a leading batch=1
+    dimension around an otherwise-unchanged [n, feature_dim] tensor — e.g.
+    GPT-2's Conv1D (exp28) explicitly flattens to 2D before its matmul and
+    back to 3D after (`x.view(-1, x.size(-1))` ... `x.view(size_out)`),
+    unlike nn.Linear which never surfaces this as a visible op. Structurally
+    a no-op under this project's batch=1 convention (every op already
+    treats n as a runtime row count, and this project has never modeled a
+    real batch dimension) — passed through as a copy rather than needing
+    any new numeric capability. Returns an ir_entry or None."""
+    if node.op_type != "Reshape" or node.input[1] not in constants:
+        return None
+    shape = [int(x) for x in np.asarray(constants[node.input[1]]).reshape(-1)]
+    if not shape:
+        return None
+    d = shape[-1]
+    if d <= 0:
+        return None
+    middle = shape[:-1]
+    while middle and middle[0] == 1:
+        middle = middle[1:]
+    if len(middle) > 1:
+        return None  # more than one real (non-batch) dim besides features
+    in_tensor = node.input[0]
+    if in_tensor not in tensor_dims or tensor_dims[in_tensor] != d:
+        return None
+    return {"op": "identity", "output": node.output[0], "input": in_tensor, "dim": d}
 
 
 def try_match_matmul_add_linear(nodes, i, initializer_names, initializers):
@@ -434,9 +552,7 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         for n in nodes:
             if list(n.output) != [tensor_name]:
                 continue
-            if n.op_type == "Gemm" and n.input[1] in initializers:
-                return int(initializers[n.input[1]].shape[0])
-            if n.op_type == "Add":
+            if n.op_type in ("Gemm", "Add"):
                 bias_candidates = [x for x in n.input if x in initializers and initializers[x].ndim == 1]
                 if len(bias_candidates) == 1:
                     return int(initializers[bias_candidates[0]].shape[0])
@@ -762,6 +878,14 @@ def parse_onnx(onnx_path):
             i = next_i
             continue
 
+        tanh_gelu_match = try_match_tanh_gelu(nodes, i, constants, tensor_dims)
+        if tanh_gelu_match is not None:
+            ir_entry, next_i = tanh_gelu_match
+            tensor_dims[ir_entry["output"]] = ir_entry["dim"]
+            ir.append(ir_entry)
+            i = next_i
+            continue
+
         linear_match = try_match_matmul_add_linear(nodes, i, initializer_names, initializers)
         if linear_match is not None:
             ir_entry, next_i = linear_match
@@ -771,10 +895,18 @@ def parse_onnx(onnx_path):
             i = next_i
             continue
 
+        identity_match = try_match_identity_reshape(node, constants, tensor_dims)
+        if identity_match is not None:
+            tensor_dims[identity_match["output"]] = identity_match["dim"]
+            ir.append(identity_match)
+            i += 1
+            continue
+
         if node.op_type not in SUPPORTED_OPS:
             raise UnsupportedGraph(
                 f"op '{node.op_type}' is not supported by this compiler outside the recognized "
-                f"self-attention / multi-head-attention / decomposed-GELU / MatMul+Add-linear patterns "
+                f"self-attention / multi-head-attention / decomposed-GELU / tanh-GELU / "
+                f"MatMul+Add-linear / batch-squeeze-reshape patterns "
                 f"(supported standalone: {sorted(SUPPORTED_OPS)})"
             )
         if len(node.output) != 1:
@@ -785,29 +917,52 @@ def parse_onnx(onnx_path):
         attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
 
         if node.op_type == "Gemm":
-            if attrs.get("transB", 0) != 1 or attrs.get("alpha", 1.0) != 1.0 or attrs.get("beta", 1.0) != 1.0:
-                raise UnsupportedGraph(f"Gemm with non-standard attrs (need transB=1, alpha=beta=1): {attrs}")
+            if attrs.get("alpha", 1.0) != 1.0 or attrs.get("beta", 1.0) != 1.0:
+                raise UnsupportedGraph(f"Gemm with non-standard attrs (need alpha=beta=1): {attrs}")
+            trans_b = attrs.get("transB", 0)
+            if trans_b not in (0, 1):
+                raise UnsupportedGraph(f"Gemm with non-standard attrs (transB must be 0 or 1): {attrs}")
             if len(non_init_inputs) != 1:
                 raise UnsupportedGraph(f"Gemm with {len(non_init_inputs)} tensor inputs, expected 1")
             in_tensor = non_init_inputs[0]
             _, w_name, b_name = node.input
-            out_dim, in_dim = initializers[w_name].shape
+            # transB=1 (the usual nn.Linear export): weight stored [out,in],
+            # matching linear()'s (common.hpp) native layout directly.
+            # transB=0 (exp28: GPT-2's Conv1D, `addmm(bias, x, weight)` with
+            # no transpose): weight stored [in,out], the same "mirror"
+            # convention exp26's MatMul+Add already handles — transposed
+            # back to [out,in] at weight-extraction time, same flag reused.
+            if trans_b == 1:
+                out_dim, in_dim = initializers[w_name].shape
+            else:
+                in_dim, out_dim = initializers[w_name].shape
             tensor_dims[in_tensor] = int(in_dim)
             tensor_dims[out_name] = int(out_dim)
-            ir.append({"op": "linear", "output": out_name, "input": in_tensor,
-                       "weight": w_name, "bias": b_name, "in_dim": int(in_dim), "out_dim": int(out_dim)})
+            ir_entry = {"op": "linear", "output": out_name, "input": in_tensor,
+                        "weight": w_name, "bias": b_name, "in_dim": int(in_dim), "out_dim": int(out_dim)}
+            if trans_b == 0:
+                ir_entry["weight_transposed"] = True
+            ir.append(ir_entry)
 
         elif node.op_type in ("Relu", "Gelu", "Softmax"):
             if len(non_init_inputs) != 1:
                 raise UnsupportedGraph(f"{node.op_type} with {len(non_init_inputs)} tensor inputs, expected 1")
             in_tensor = non_init_inputs[0]
+            op_name = {"Relu": "relu", "Gelu": "gelu", "Softmax": "softmax"}[node.op_type]
             if node.op_type == "Gelu":
+                # exp28: opset>=20's fused Gelu carries an `approximate`
+                # attribute — "tanh" (GPT-2's "gelu_new") is a genuinely
+                # DIFFERENT function from the default exact/erf formula,
+                # not just a different encoding of the same one (unlike
+                # exp24's decomposed-vs-fused exact GELU), so it gets its
+                # own IR op and codegen, not the existing "gelu"'s.
                 approx = attrs.get("approximate", b"none")
-                if approx not in (b"none", "none"):
-                    raise UnsupportedGraph(f"Gelu approximate={approx!r} not supported — only exact/erf-based GELU")
+                if approx in (b"tanh", "tanh"):
+                    op_name = "gelu_tanh"
+                elif approx not in (b"none", "none"):
+                    raise UnsupportedGraph(f"Gelu approximate={approx!r} not supported — only exact/erf or tanh")
             if node.op_type == "Softmax" and attrs.get("axis", -1) not in (-1, 1):
                 raise UnsupportedGraph(f"Softmax over unsupported axis: {attrs.get('axis')}")
-            op_name = {"Relu": "relu", "Gelu": "gelu", "Softmax": "softmax"}[node.op_type]
             tensor_dims[out_name] = tensor_dims[in_tensor]
             ir.append({"op": op_name, "output": out_name, "input": in_tensor, "dim": tensor_dims[in_tensor]})
 
@@ -820,6 +975,11 @@ def parse_onnx(onnx_path):
             _, w_name, b_name = node.input
             dim = int(initializers[w_name].shape[0])
             eps = float(attrs.get("epsilon", 1e-5))
+            # exp28: pre-norm models (LayerNorm before the sub-block, not
+            # after) can make LayerNorm the FIRST consumer of the graph's
+            # own input tensor — every prior model was post-norm, where
+            # some earlier Linear had already recorded the input's dim.
+            tensor_dims[in_tensor] = dim
             tensor_dims[out_name] = dim
             ir.append({"op": "layernorm", "output": out_name, "input": in_tensor,
                        "weight": w_name, "bias": b_name, "dim": dim, "eps": eps})
@@ -841,8 +1001,8 @@ def parse_onnx(onnx_path):
 
         i += 1
 
-    if not ir or ir[0]["op"] != "linear":
-        raise UnsupportedGraph("this compiler requires the graph to start with a Linear (Gemm) layer")
+    if not ir:
+        raise UnsupportedGraph("this compiler produced an empty graph")
 
     return ir, initializers, graph_input_name
 
@@ -854,7 +1014,11 @@ def generate_cpp(ir, graph_input_name):
     def var(tensor_name):
         return "X" if tensor_name == graph_input_name else cpp_id(tensor_name)
 
-    input_dim = ir[0]["in_dim"]
+    # exp28: a pre-norm model (LayerNorm before the sub-block, not after —
+    # GPT-2's convention) can start with `layernorm` rather than `linear`;
+    # every dim-preserving op ("dim") or Linear ("in_dim") knows its own
+    # input width either way.
+    input_dim = ir[0].get("in_dim", ir[0].get("dim"))
     # Last Linear's out_dim — correct for every model tested so far (all end in a
     # projection). A model ending directly in attention/LayerNorm with no trailing
     # Linear would need this generalized; not attempted since no test case needs it yet.
@@ -873,13 +1037,18 @@ def generate_cpp(ir, graph_input_name):
             in_var = var(op["input"])
             forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {op['out_dim']});")
             forward_lines.append(f"        linear({in_var}.data(), n, {op['in_dim']}, {w}.data(), {b}.data(), {op['out_dim']}, {out_var}.data());")
-        elif op["op"] in ("relu", "gelu", "softmax"):
+        elif op["op"] == "identity":
+            # A pure batch=1 squeeze/unsqueeze reshape (exp28) — nothing to
+            # compute, just a name for the same [n, dim] data.
+            in_var = var(op["input"])
+            forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
+        elif op["op"] in ("relu", "gelu", "gelu_tanh", "softmax"):
             in_var = var(op["input"])
             forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
             if op["op"] == "softmax":
                 forward_lines.append(f"        softmax_rows({out_var}.data(), n, {op['dim']});")
             else:
-                fn = "relu_inplace" if op["op"] == "relu" else "gelu_inplace"
+                fn = {"relu": "relu_inplace", "gelu": "gelu_inplace", "gelu_tanh": "gelu_tanh_inplace"}[op["op"]]
                 forward_lines.append(f"        {fn}({out_var}.data(), {out_var}.size());")
         elif op["op"] == "layernorm":
             w, b = cpp_id(op["weight"]), cpp_id(op["bias"])

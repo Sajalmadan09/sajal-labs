@@ -62,6 +62,18 @@ inline void gelu_inplace(float* data, size_t n) {
     for (size_t i = 0; i < n; ++i) data[i] = 0.5f * data[i] * (1.0f + erff(data[i] / 1.4142135f));
 }
 
+// exp28: the tanh APPROXIMATION of GELU ("gelu_new" in transformers, e.g.
+// GPT-2's activation) — a genuinely different function from gelu_inplace
+// above, not just a different encoding of the same one. Formula:
+// 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))).
+inline void gelu_tanh_inplace(float* data, size_t n) {
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    for (size_t i = 0; i < n; ++i) {
+        float x = data[i];
+        data[i] = 0.5f * x * (1.0f + std::tanh(kSqrt2OverPi * (x + 0.044715f * x * x * x)));
+    }
+}
+
 inline void softmax_rows(float* data, int rows, int cols) {
     for (int i = 0; i < rows; ++i) {
         float* row = data + static_cast<size_t>(i) * cols;

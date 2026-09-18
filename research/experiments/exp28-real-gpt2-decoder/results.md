@@ -1,0 +1,47 @@
+# Experiment 28 — A Real GPT-2 Decoder Model
+
+**Why this experiment**: exp27 added causal masking but only validated it on synthetic test models. GPT-2 (the actual, real `gpt2` checkpoint — 124M params, hidden=768, 12 heads, 12 layers) is the natural real decoder to try it against, the same way exp25/26 used real bert-tiny for the encoder side.
+
+**The result, same shape as exp25/26**: inspecting a real GPT-2 decoder block's actual export (`transformers.GPT2Model`, `dynamo=False`) surfaced six real differences from every encoder model tested through exp27. Three were closed directly as genuine compiler widenings — general enough to help future models, not just this one. Two more turned out to be non-issues once actually tried. One (combined Q/K/V via a single `Split`-based projection) was deliberately routed around, same as exp25's handling of BERT's stray `Gather` — named honestly rather than either ignored or over-scoped into this experiment.
+
+## The six differences, and what happened to each
+
+**1. Conv1D's flatten/unflatten `Reshape` wrapping — closed directly.** GPT-2 doesn't use `nn.Linear`; it uses its own `Conv1D`, whose `forward()` explicitly does `x.view(-1, x.size(-1))` before the matmul and `x.view(size_out)` after — surfacing a `Reshape` pair around every single linear layer that plain `nn.Linear` never exposes. `try_match_identity_reshape` recognizes any `Reshape` that only adds or removes leading batch=1 dimensions around an unchanged `[n, dim]` tensor as a no-op copy — a direct consequence of this project's batch=1 convention (every op already treats `n` as a runtime row count, so a reshape that only touches a dimension nobody was using anyway is provably inert). General-purpose: any future Conv1D-shaped or explicitly-batched model benefits, not just GPT-2.
+
+**2. `Conv1D`'s `Gemm(transB=0)` — closed directly.** `Conv1D` computes `addmm(bias, x, weight)` with the weight **not** transposed, unlike `nn.Linear`'s usual `Gemm(transB=1)`. The Gemm handler now accepts `transB` of 0 or 1, marking `weight_transposed=True` for the `transB=0` case and reusing exp26's existing mechanism (transpose back to `[out,in]` at weight-extraction time) — no new codegen needed, just recognizing a second weight orientation.
+
+**3. `"gelu_new"` (tanh-approximation GELU) — closed directly, and correctly kept SEPARATE from exact GELU.** GPT-2's activation is a genuinely different function from the exact/erf formula exp16/24 already handle, not just a different encoding of the same one — conflating them would have been a real, silent correctness bug, not a missed pattern. Added: `try_match_tanh_gelu` (an 8-node decomposed-form matcher, for opset<20), a fused-op path (opset≥20's `Gelu` with `approximate="tanh"`), a distinct `gelu_tanh` IR op (never reusing `"gelu"`), and `common.hpp`'s `gelu_tanh_inplace`. Real GPT-2's own export at opset 20 uses the **fused** form — the decomposed matcher was verified separately, against `transformers.activations.NewGELUActivation` **imported directly**, not reconstructed, because a generic `F.gelu(x, approximate='tanh')` call turned out to decompose *differently* (`x**3` via two `Mul`s instead of `Pow`, constants in a different order) at the same opset. Two calls that compute identical math produced different graphs — `try_match_tanh_gelu` matches the one GPT-2's own code actually emits, verified against that exact class, not a guess.
+
+**4. Pre-norm residual placement — turned out to need nothing.** GPT-2 is pre-norm (`x = x + attn(ln1(x))`), the opposite ordering from every prior post-norm model (BERT, exp2). The DAG-based IR (exp17) never assumed an order, so this needed no design change — but it *did* expose a real, narrow bug: `LayerNormalization`'s handler recorded its output's dimension but never its input's, because every previous model had that input's dimension already established by an earlier `Linear`. Pre-norm's first op can be a `LayerNorm` consuming the raw graph input directly, which nothing else ever recorded a dimension for — one line fixed it (`tensor_dims[in_tensor] = dim`, alongside the existing output line). Found by the compiler's own error message (`Add operand dim not yet known`), not by inspection ahead of time.
+
+**5. The "must start with Linear" check — turned out to be too strict.** A leftover exp15-era assumption (`ir[0]["op"] != "linear"` → reject) that happened to hold for every post-norm model tried so far. Pre-norm models start with `layernorm`. Relaxed to just require a non-empty IR, and `generate_cpp`'s `input_dim` derivation now reads either `in_dim` (Linear) or `dim` (every dimension-preserving op) from `ir[0]`.
+
+**6. Combined Q/K/V via one `Split`-based projection — named honestly, routed around, not closed.** GPT-2's `c_attn` is one `Conv1D` producing `3*d_model` outputs, split via ONNX `Split` into Q/K/V. This is a real, structural gap: the multi-head attention codegen already addresses per-*head* slices of a buffer via pointer offsets — extending that to also address per-*QKV-slot* slices of one combined buffer is mechanically plausible but would have meant redesigning how the attention IR entry's `q`/`k`/`v` fields reference weights, which is more than this one experiment should absorb alongside the other five findings. Same call exp25 made for BERT's stray `Gather`: close what's tractable and useful beyond this one model, name what isn't, don't force it in.
+
+## The rewired test: real weights, this project's own Q/K/V convention
+
+[python/export_real_gpt2_test.py](../../../python/export_real_gpt2_test.py) copies real `gpt2` weights (`c_attn`'s combined matrix split into three separate slices — the *values*, not a re-derivation) into three separate `nn.Linear`s, matching exp20's Q/K/V convention instead of `Split`. Everything else is genuinely direct: real pre-norm order, real per-layer `LayerNorm` eps, real `tanh`-approximation GELU (now natively supported, no rewiring needed there), and exp27's already-supported causal-masking idiom.
+
+**Verified faithful before treating it as ground truth**: ran the rewired wrapper against real GPT-2's own embeddings for a real sentence, and compared against calling `hf_model.h[:2]` directly (plain Python, no ONNX) — max abs diff `1.53e-05`, consistent with ordinary fp32 rounding at this much larger scale (hidden=768, 6x bert-tiny's 128) plus the tanh approximation's own sensitivity, not a different computation.
+
+## Validation
+
+**Regression, all 16 prior compiler targets** (exp1, exp9, exp16-27) recompiled from scratch after every change in this experiment — still bit-identical. This matters more than usual: several of this round's fixes touch core, shared code paths (`Gemm`'s attribute handling, `LayerNorm`'s dimension bookkeeping, the graph-start check) that every prior target also passes through.
+
+**2 real GPT-2 decoder blocks, direct compile**: PyTorch equivalence vs. the rewired wrapper's own output: max abs error `1.22e-04` (mean `1.06e-06`, cosine similarity `1.0`) — looser than BERT's numbers, consistent with the much larger hidden size and the tanh approximation's own rounding sensitivity, not a red flag. **Bit-identical** against a new hand-written reference ([native/real_gpt2_reference.cpp](../../../native/real_gpt2_reference.cpp)) — the first reference file in this project with pre-norm ordering, causal masking, and tanh-GELU all three, none reused unchanged from an earlier experiment.
+
+**Decomposed tanh-GELU, isolated**: bit-identical-tight PyTorch equivalence (`1.19e-07`) against `NewGELUActivation` directly.
+
+**Negative paths**: the real (unrewired) HF trace, containing `Split`, still rejects cleanly (`error: op 'Split' is not supported...`) rather than silently misreading it. A corrupted tanh-GELU coefficient (`0.044715 → 0.05`) also rejects cleanly.
+
+## Interpretation
+
+Three genuine, general-purpose widenings came out of trying one real model neither this compiler nor its test suite had ever seen the shape of: a batch-squeeze reshape, a second Linear weight orientation, and a second GELU variant that had to be kept mathematically distinct from the first rather than merged for convenience. Two apparent risks (pre-norm ordering, the too-strict start-of-graph check) turned out to be shallow — one needed no design change at all, the other a one-line dimension-bookkeeping fix once the compiler's own error message pointed at it directly. And one real capability gap (`Split`-based combined QKV) was named rather than absorbed, consistent with this project's running theme since exp25: testing against something real is what finds the gaps a synthetic model can't, and not every gap found needs to be closed in the same sitting it was found in.
+
+## Caveats
+
+Same scope as exp25/26 for BERT: the decoder-block stack alone (2 of GPT-2's 12 layers), no token/position embedding op support, no `lm_head`. `try_match_tanh_gelu`'s decomposed-form matcher recognizes the exact shape `NewGELUActivation` emits — a differently-shaped-but-equivalent decomposition (as the generic `F.gelu(approximate='tanh')` call demonstrated) would fail cleanly rather than being silently handled. Combined-QKV `Split` support remains a named, open gap.
+
+## Next experiment
+
+Either close the `Split`-based combined-QKV gap directly (the natural remaining piece for accepting GPT-2's own real export as-is, no rewiring); or stack more than 2 of GPT-2's 12 real layers to see whether depth alone surfaces anything exp23's stacking fix didn't already cover.
