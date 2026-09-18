@@ -1,4 +1,4 @@
-"""exp15-24: the smallest real ONNX -> native C++ compiler.
+"""exp15-26: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -52,6 +52,24 @@ strictly sequential chain), so a positional lookahead (like exp18's
 try_match_self_attention) is safe here — exp23's tensor-flow-tracing
 rewrite was needed specifically because attention's branches interleave
 with other nodes; a linear chain never does.
+
+exp25: tried the compiler against prajjwal1/bert-tiny's REAL export
+(dynamo=False, HF's own BertLayer.forward()) — found 4 real gaps
+(MatMul+Add instead of Gemm, 4D-batched attention, split pre-matmul
+scaling, an unexplained Gather) and routed around them by rewiring the
+real weights into this project's own known convention instead.
+
+exp26: closed two of those four gaps directly, rather than continuing to
+route around them — see try_match_matmul_add_linear and
+try_match_multihead_attention's generalized shape/scale handling below.
+Result: bert-tiny's real 2-layer encoder, traced by HF's own code with
+ZERO rewiring, now compiles and matches HF's actual forward pass to
+2.86e-06 — a stronger result than exp25's rewired version. Also the first
+compiler target that isn't bit-identical to a hand-written reference (see
+exp26/results.md) — traced to combining two independently-rounded scale
+factors via Python float multiplication, not a bug: the exact IEEE-754
+non-associativity caveat this project's methodology has named since exp1,
+finally encountered in practice.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -158,6 +176,50 @@ def try_match_decomposed_gelu(nodes, i, constants, tensor_dims):
     return {"op": "gelu", "output": n4.output[0], "input": x_tensor, "dim": tensor_dims[x_tensor]}, i + 5
 
 
+def try_match_matmul_add_linear(nodes, i, initializer_names, initializers):
+    """Matches `MatMul(x, W) -> Add(matmul_out, bias)` as an alternate
+    encoding of Linear. Every prior experiment's exports produced a single
+    `Gemm(transB=1)` node for `nn.Linear`; a REAL Hugging Face export
+    (exp25/26) instead traces it as this 2-node pair, with `W` stored
+    [in_dim, out_dim] — the mirror of Gemm's [out_dim, in_dim] convention,
+    since a plain MatMul (no transpose flag) needs the weight
+    pre-transposed to compute the same `x @ W_gemm^T`. The IR entry marks
+    `weight_transposed=True` so weight-extraction transposes it back to
+    [out,in] at compile time — the exact same generated C++ (`linear()`,
+    common.hpp) handles both encodings unchanged; only which bytes land in
+    the .bin file differs.
+    Returns (ir_entry, next_index) or None."""
+    if i + 1 >= len(nodes):
+        return None
+    n0, n1 = nodes[i], nodes[i + 1]
+    if n0.op_type != "MatMul":
+        return None
+    w_candidates = [x for x in n0.input if x in initializer_names]
+    x_candidates = [x for x in n0.input if x not in initializer_names]
+    if len(w_candidates) != 1 or len(x_candidates) != 1:
+        return None
+    w_name, in_tensor = w_candidates[0], x_candidates[0]
+    matmul_out = n0.output[0]
+
+    if n1.op_type != "Add" or matmul_out not in n1.input:
+        return None
+    bias_candidates = [x for x in n1.input if x != matmul_out]
+    if len(bias_candidates) != 1 or bias_candidates[0] not in initializer_names:
+        return None
+    b_name = bias_candidates[0]
+
+    w_shape = initializers[w_name].shape
+    if len(w_shape) != 2:
+        return None
+    in_dim, out_dim = w_shape
+    if initializers[b_name].shape != (out_dim,):
+        return None
+
+    return {"op": "linear", "output": n1.output[0], "input": in_tensor,
+            "weight": w_name, "bias": b_name, "in_dim": int(in_dim), "out_dim": int(out_dim),
+            "weight_transposed": True}, i + 2
+
+
 def try_match_self_attention(nodes, i, constants, tensor_dims):
     """Looks for exactly: Transpose(K,[1,0]) -> MatMul(Q,K^T) -> Mul(scale)
     -> Softmax -> MatMul(attn,V), starting at nodes[i]. Returns
@@ -211,53 +273,78 @@ def try_match_self_attention(nodes, i, constants, tensor_dims):
 
 
 def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers):
-    """Looks for the 12-node multi-head split/attend/merge pattern PyTorch's
+    """Looks for the multi-head split/attend/merge pattern PyTorch's
     exporter emits for `q.view(seq,H,Dh).transpose(0,1)` etc: three
-    (Reshape->Transpose) branches splitting Q/K/V into heads, MatMul->Mul/
-    Div->Softmax->MatMul attending per head (batched over the head dim),
-    then a final Transpose->Reshape merging heads back to [seq,D]. Unlike
-    try_match_self_attention, these nodes are NOT contiguous in nodes[i:] —
-    PyTorch interleaves Q/K/V's Gemm nodes with the Reshape/Transpose nodes
-    of branches parsed earlier — so this searches by tensor-name flow
-    (who consumes whose output, who produces whose input) rather than
-    position, starting only when nodes[i] looks like the first half of one
-    head-split branch.
+    (Reshape->Transpose) branches splitting Q/K/V into heads, a MatMul/
+    scale/Softmax/MatMul attending per head (batched over the head dim),
+    then a final Transpose->Reshape merging heads back. These nodes are
+    NOT contiguous in nodes[i:] — PyTorch interleaves Q/K/V's linear nodes
+    with the Reshape/Transpose nodes of branches parsed earlier — so this
+    searches by tensor-name flow (who consumes whose output, who produces
+    whose input) rather than position, starting only when nodes[i] looks
+    like the first half of one head-split branch.
 
     exp23: every lookup here traces a SPECIFIC tensor name forward or
     backward from wherever nodes[i] sits (never "find all nodes shaped
     like X anywhere in the graph") — necessary once a graph can contain
-    more than one attention instance (stacked encoder blocks): an earlier
-    version collected reshapes by matching shape/dim globally, which
-    silently merged branches from different blocks that happened to share
-    the same (num_heads, d_head). Being purely trace-driven makes this
-    correct regardless of how many other identically-shaped attention
-    blocks exist elsewhere in the same graph.
+    more than one attention instance (stacked encoder blocks).
+
+    exp26: generalized twice more, both times because a REAL Hugging Face
+    export (exp25) shapes this differently than every synthetic test model
+    had: (1) accepts either the 3D convention (batch squeezed out —
+    reshape to [seq,H,Dh], perm [1,0,2]/[1,2,0]) or the 4D convention
+    (explicit batch=1 — reshape to [1,seq,H,Dh], perm [0,2,1,3]/[0,2,3,1])
+    via classify_perm(); (2) accepts scaling applied as ONE Mul/Div after
+    the pre-softmax MatMul (exp20/22's synthetic models) OR as TWO
+    separate Mul/Div ops applied to Q and K individually BEFORE that
+    MatMul (HF's actual SDPA-derived export, each by d_head**-0.25) via
+    unwrap_scale_forward/backward, which walk past zero-or-one such
+    scale-wrap nodes in either direction and fold the factor into one
+    combined scale for codegen either way.
 
     Returns (ir_entry, consumed_indices) or None. consumed_indices is the
     full set of node indices this match uses; the caller must defer
     appending ir_entry to the IR list until it reaches max(consumed_indices)
-    — Q/K/V's own Gemm nodes (not part of consumed_indices) may sit at
+    — Q/K/V's own linear nodes (not part of consumed_indices) may sit at
     later positions than nodes[i], and the generated C++ must declare their
     outputs before the fused op reads them."""
     node0 = nodes[i]
     if node0.op_type != "Reshape" or node0.input[1] not in constants:
         return None
     shape0 = [int(x) for x in np.asarray(constants[node0.input[1]]).reshape(-1)]
-    if len(shape0) != 3:
+    if len(shape0) == 4 and shape0[0] != 1:
         return None
-    num_heads, d_head = shape0[1], shape0[2]
-    d = num_heads * d_head
+    if len(shape0) not in (3, 4):
+        return None
+    d_head = shape0[-1]
 
     def resolve_dim(tensor_name):
+        """A tensor's feature dim — from tensor_dims if the main walk has
+        already processed its producer, else by looking directly at
+        whichever node produces it (needed here because, e.g., K's and
+        V's own linear nodes may sit AFTER nodes[i] in the node list, not
+        yet reached by the main walk when Q's branch triggers this match
+        first). Reads the bias's own 1-D shape rather than the weight's,
+        since that's the same regardless of whether the linear is a single
+        Gemm(transB=1) (exp15+) or a MatMul+Add pair (exp26 — modern
+        torch.onnx emits this instead for some real models' Linear)."""
         if tensor_name in tensor_dims:
             return tensor_dims[tensor_name]
         for n in nodes:
-            if n.op_type == "Gemm" and list(n.output) == [tensor_name] and n.input[1] in initializers:
+            if list(n.output) != [tensor_name]:
+                continue
+            if n.op_type == "Gemm" and n.input[1] in initializers:
                 return int(initializers[n.input[1]].shape[0])
+            if n.op_type == "Add":
+                bias_candidates = [x for x in n.input if x in initializers and initializers[x].ndim == 1]
+                if len(bias_candidates) == 1:
+                    return int(initializers[bias_candidates[0]].shape[0])
         return None
 
-    if resolve_dim(node0.input[0]) != d:
+    d = resolve_dim(node0.input[0])
+    if d is None or d_head <= 0 or d % d_head != 0:
         return None
+    num_heads = d // d_head
 
     def find_consumers(tensor_name, op_type):
         return [(idx, n) for idx, n in enumerate(nodes) if tensor_name in n.input and n.op_type == op_type]
@@ -265,17 +352,77 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
     def find_producer(tensor_name):
         """Unfiltered — returns whichever node produces this tensor,
         regardless of op_type, so the caller can branch on what kind of
-        node it turns out to be. Unlike exp20's original global shape scan,
-        every lookup in this function is tensor-name-exact, so it never
-        widens to nodes from a DIFFERENT attention instance even when
-        several blocks in a stack share the identical (num_heads, d_head)
-        shape (exp23: multi-block stacking exposed exactly this — the old
-        version collected reshapes from every block at once)."""
+        node it turns out to be. Every lookup in this function is
+        tensor-name-exact, so it never widens to nodes from a different
+        attention instance (exp23) or misreads a differently-shaped real
+        export (exp26) as something it isn't."""
         matches = [(idx, n) for idx, n in enumerate(nodes) if list(n.output) == [tensor_name]]
         return matches[0] if len(matches) == 1 else None
 
     def perm_of(transpose_node):
         return next((list(a.ints) for a in transpose_node.attribute if a.name == "perm"), None)
+
+    def classify_perm(perm):
+        """'qv' or 'k' for either the 3D convention (perm [1,0,2]/[1,2,0])
+        or the 4D batch=1 convention (perm [0,2,1,3]/[0,2,3,1] — same
+        split, PyTorch just carries the batch dim through). None if it
+        matches neither."""
+        if perm in ([1, 0, 2], [0, 2, 1, 3]):
+            return "qv"
+        if perm in ([1, 2, 0], [0, 2, 3, 1]):
+            return "k"
+        return None
+
+    def unwrap_scale_forward(tensor_name):
+        """If tensor_name's unique consumer is a Mul/Div-by-constant,
+        follows through it. Returns (final_tensor, cumulative_scale,
+        consumed_idx_or_None)."""
+        consumers = [(idx, n) for idx, n in enumerate(nodes) if tensor_name in n.input]
+        if len(consumers) != 1 or consumers[0][1].op_type not in ("Mul", "Div"):
+            return tensor_name, 1.0, None
+        idx, node = consumers[0]
+        match = try_match_scale(node, tensor_name, constants)
+        if match is None:
+            return tensor_name, 1.0, None
+        scale, out_tensor = match
+        return out_tensor, scale, idx
+
+    def unwrap_scale_backward(tensor_name):
+        """Mirror of unwrap_scale_forward, walking backward: if
+        tensor_name's producer is a Mul/Div-by-constant, unwraps to the
+        tensor it scaled. Returns (underlying_tensor, cumulative_scale,
+        (producer_idx, producer_node), consumed_idx_or_None) — producer is
+        whichever REAL (non-scale) op produced the unwrapped tensor."""
+        producer = find_producer(tensor_name)
+        if producer is None:
+            return None
+        idx, node = producer
+        if node.op_type in ("Mul", "Div"):
+            non_const = [x for x in node.input if x not in constants]
+            if len(non_const) == 1:
+                match = try_match_scale(node, non_const[0], constants)
+                if match is not None:
+                    scale, _ = match
+                    return non_const[0], scale, None, idx  # caller re-resolves producer of non_const[0]
+        return tensor_name, 1.0, (idx, node), None
+
+    def resolve_backward(tensor_name):
+        """Repeatedly applies unwrap_scale_backward until it reaches a
+        real (non-scale) producer. Returns (final_tensor, total_scale,
+        (producer_idx, producer_node), consumed_indices_set)."""
+        total_scale = 1.0
+        consumed_here = set()
+        while True:
+            result = unwrap_scale_backward(tensor_name)
+            if result is None:
+                return None
+            tensor_or_final, scale, producer, skipped_idx = result
+            total_scale *= scale
+            if skipped_idx is not None:
+                consumed_here.add(skipped_idx)
+                tensor_name = tensor_or_final
+                continue
+            return tensor_or_final, total_scale, producer, consumed_here
 
     def branch_from_reshape(r_idx, r_node):
         """(Reshape, Transpose) pair starting at r_node — verifies shape/dim
@@ -289,17 +436,21 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         if len(consumers) != 1:
             return None
         t_idx, t_node = consumers[0]
-        perm = perm_of(t_node)
-        if perm is None or len(perm) != 3:
+        role = classify_perm(perm_of(t_node) or [])
+        if role is None:
             return None
-        return {"reshape_idx": r_idx, "transpose_idx": t_idx, "perm": perm,
+        return {"reshape_idx": r_idx, "transpose_idx": t_idx, "role": role,
                 "out": t_node.output[0], "linear": r_node.input[0]}
 
     def branch_from_transposed_tensor(tensor_name):
-        """Traces backward from a Transpose's output tensor to its
-        (Reshape, Transpose) branch."""
-        producer = find_producer(tensor_name)
-        if producer is None or producer[1].op_type != "Transpose":
+        """Traces backward from a (possibly pre-scaled) Transpose output
+        tensor to its (Reshape, Transpose) branch. Returns
+        (branch_dict, scale_factor, consumed_indices) or None."""
+        resolved = resolve_backward(tensor_name)
+        if resolved is None:
+            return None
+        real_tensor, scale, producer, consumed_here = resolved
+        if producer[1].op_type != "Transpose":
             return None
         t_idx, t_node = producer
         r_producer = find_producer(t_node.input[0])
@@ -309,81 +460,87 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         branch = branch_from_reshape(r_idx, r_node)
         if branch is None or branch["transpose_idx"] != t_idx:
             return None
-        return branch
+        return branch, scale, consumed_here
 
     branch0 = branch_from_reshape(i, node0)
     if branch0 is None:
         return None
 
-    mm_a_matches = find_consumers(branch0["out"], "MatMul")
+    consumed_scale_nodes = set()
+
+    mm_a_tensor, prescale0, prescale0_idx = unwrap_scale_forward(branch0["out"])
+    if prescale0_idx is not None:
+        consumed_scale_nodes.add(prescale0_idx)
+    mm_a_matches = find_consumers(mm_a_tensor, "MatMul")
     if len(mm_a_matches) != 1:
         return None
     mm_a_idx, mm_a_node = mm_a_matches[0]
-    other = [x for x in mm_a_node.input if x != branch0["out"]]
+    other = [x for x in mm_a_node.input if x != mm_a_tensor]
     if len(other) != 1:
         return None
-    other_producer = find_producer(other[0])
-    if other_producer is None:
+    other_resolved = resolve_backward(other[0])
+    if other_resolved is None:
         return None
+    _, _, other_producer, other_consumed = other_resolved
+    consumed_scale_nodes |= other_consumed
 
     if other_producer[1].op_type == "Softmax":
         # branch0 is V (feeds the post-softmax MatMul); trace backward
-        # through softmax -> scale -> mm_pre to find Q and K.
-        if branch0["perm"] != [1, 0, 2]:
+        # through softmax -> mm_pre to find Q and K.
+        if branch0["role"] != "qv":
             return None
-        v_branch = branch0
+        v_branch, v_scale = branch0, prescale0
         mm_post_idx, mm_post_node = mm_a_idx, mm_a_node
         softmax_idx, softmax_node = other_producer
-        scale_producer = find_producer(softmax_node.input[0])
-        if scale_producer is None or scale_producer[1].op_type not in ("Mul", "Div"):
+
+        mm_pre_result = resolve_backward(softmax_node.input[0])
+        if mm_pre_result is None:
             return None
-        mul_idx, mul_node = scale_producer
-        pre_scale_tensor = [x for x in mul_node.input if x not in constants]
-        if len(pre_scale_tensor) != 1:
+        mm_pre_tensor, mm_pre_scale, mm_pre_producer, mm_pre_consumed = mm_pre_result
+        if mm_pre_producer[1].op_type != "MatMul":
             return None
-        scale_match = try_match_scale(mul_node, pre_scale_tensor[0], constants)
-        if scale_match is None:
-            return None
-        scale_value = scale_match[0]
-        mm_pre_producer = find_producer(pre_scale_tensor[0])
-        if mm_pre_producer is None or mm_pre_producer[1].op_type != "MatMul":
-            return None
+        consumed_scale_nodes |= mm_pre_consumed
         mm_pre_idx, mm_pre_node = mm_pre_producer
         qk_tensors = list(mm_pre_node.input)
         if len(qk_tensors) != 2:
             return None
-        branch_a = branch_from_transposed_tensor(qk_tensors[0])
-        branch_b = branch_from_transposed_tensor(qk_tensors[1])
-        if branch_a is None or branch_b is None:
+        result_a = branch_from_transposed_tensor(qk_tensors[0])
+        result_b = branch_from_transposed_tensor(qk_tensors[1])
+        if result_a is None or result_b is None:
             return None
-        k_branch = next((b for b in (branch_a, branch_b) if b["perm"] == [1, 2, 0]), None)
-        q_branch = next((b for b in (branch_a, branch_b) if b["perm"] == [1, 0, 2] and b is not k_branch), None)
-        if k_branch is None or q_branch is None or k_branch is q_branch:
+        branch_a, scale_a, consumed_a = result_a
+        branch_b, scale_b, consumed_b = result_b
+        consumed_scale_nodes |= consumed_a | consumed_b
+        if branch_a["role"] == "k" and branch_b["role"] == "qv":
+            k_branch, q_branch, qk_scale = branch_a, branch_b, scale_a * scale_b
+        elif branch_a["role"] == "qv" and branch_b["role"] == "k":
+            q_branch, k_branch, qk_scale = branch_a, branch_b, scale_a * scale_b
+        else:
             return None
+        scale_value = mm_pre_scale * qk_scale * v_scale
+
     elif other_producer[1].op_type == "Transpose":
         # branch0 is Q or K (both feed mm_pre, the pre-softmax MatMul);
-        # trace forward through scale -> softmax -> mm_post to find V.
-        other_branch = branch_from_transposed_tensor(other[0])
-        if other_branch is None:
+        # trace forward through softmax -> mm_post to find V.
+        other_result = branch_from_transposed_tensor(other[0])
+        if other_result is None:
             return None
+        other_branch, other_scale, other_branch_consumed = other_result
+        consumed_scale_nodes |= other_branch_consumed
         mm_pre_idx, mm_pre_node = mm_a_idx, mm_a_node
-        if branch0["perm"] == [1, 2, 0] and other_branch["perm"] == [1, 0, 2]:
+        if branch0["role"] == "k" and other_branch["role"] == "qv":
             k_branch, q_branch = branch0, other_branch
-        elif branch0["perm"] == [1, 0, 2] and other_branch["perm"] == [1, 2, 0]:
+        elif branch0["role"] == "qv" and other_branch["role"] == "k":
             q_branch, k_branch = branch0, other_branch
         else:
             return None
+        qk_scale = prescale0 * other_scale
 
-        scale_matches = find_consumers(mm_pre_node.output[0], "Mul") + find_consumers(mm_pre_node.output[0], "Div")
-        if len(scale_matches) != 1:
-            return None
-        mul_idx, mul_node = scale_matches[0]
-        scale_match = try_match_scale(mul_node, mm_pre_node.output[0], constants)
-        if scale_match is None:
-            return None
-        scale_value, scaled_tensor = scale_match
+        post_scale_tensor, post_scale, post_scale_idx = unwrap_scale_forward(mm_pre_node.output[0])
+        if post_scale_idx is not None:
+            consumed_scale_nodes.add(post_scale_idx)
 
-        softmax_matches = find_consumers(scaled_tensor, "Softmax")
+        softmax_matches = find_consumers(post_scale_tensor, "Softmax")
         if len(softmax_matches) != 1:
             return None
         softmax_idx, softmax_node = softmax_matches[0]
@@ -395,9 +552,14 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
         v_candidates = [x for x in mm_post_node.input if x != softmax_node.output[0]]
         if len(v_candidates) != 1:
             return None
-        v_branch = branch_from_transposed_tensor(v_candidates[0])
-        if v_branch is None or v_branch["perm"] != [1, 0, 2]:
+        v_result = branch_from_transposed_tensor(v_candidates[0])
+        if v_result is None:
             return None
+        v_branch, v_scale, v_consumed = v_result
+        if v_branch["role"] != "qv":
+            return None
+        consumed_scale_nodes |= v_consumed
+        scale_value = qk_scale * post_scale * v_scale
     else:
         return None
 
@@ -405,7 +567,7 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
     if len(final_t_matches) != 1:
         return None
     final_t_idx, final_t_node = final_t_matches[0]
-    if perm_of(final_t_node) != [1, 0, 2]:
+    if classify_perm(perm_of(final_t_node) or []) != "qv":
         return None
 
     final_r_matches = find_consumers(final_t_node.output[0], "Reshape")
@@ -415,13 +577,15 @@ def try_match_multihead_attention(nodes, i, constants, tensor_dims, initializers
     if final_r_node.input[1] not in constants:
         return None
     final_shape = [int(x) for x in np.asarray(constants[final_r_node.input[1]]).reshape(-1)]
-    if len(final_shape) != 2 or final_shape[-1] != d:
+    if len(final_shape) not in (2, 3) or final_shape[-1] not in (-1, d):
+        return None
+    if len(final_shape) == 3 and final_shape[0] not in (-1, 1):
         return None
 
     branches = (q_branch, k_branch, v_branch)
     consumed = {b["reshape_idx"] for b in branches} | {b["transpose_idx"] for b in branches} | {
-        mm_pre_idx, mul_idx, softmax_idx, mm_post_idx, final_t_idx, final_r_idx,
-    }
+        mm_pre_idx, softmax_idx, mm_post_idx, final_t_idx, final_r_idx,
+    } | consumed_scale_nodes
     ir_entry = {"op": "multihead_self_attention", "q": q_branch["linear"], "k": k_branch["linear"],
                 "v": v_branch["linear"], "num_heads": num_heads, "d_head": d_head,
                 "scale": scale_value, "output": final_r_node.output[0], "dim": d}
@@ -488,10 +652,19 @@ def parse_onnx(onnx_path):
             i = next_i
             continue
 
+        linear_match = try_match_matmul_add_linear(nodes, i, initializer_names, initializers)
+        if linear_match is not None:
+            ir_entry, next_i = linear_match
+            tensor_dims[ir_entry["input"]] = ir_entry["in_dim"]
+            tensor_dims[ir_entry["output"]] = ir_entry["out_dim"]
+            ir.append(ir_entry)
+            i = next_i
+            continue
+
         if node.op_type not in SUPPORTED_OPS:
             raise UnsupportedGraph(
                 f"op '{node.op_type}' is not supported by this compiler outside the recognized "
-                f"self-attention / multi-head-attention / decomposed-GELU patterns "
+                f"self-attention / multi-head-attention / decomposed-GELU / MatMul+Add-linear patterns "
                 f"(supported standalone: {sorted(SUPPORTED_OPS)})"
             )
         if len(node.output) != 1:
@@ -773,7 +946,15 @@ def compile_model(onnx_path, source_artifacts_dir, out_dir):
 
     for op in ir:
         if op["op"] in ("linear", "layernorm"):
-            initializers[op["weight"]].astype(np.float32).tofile(out_dir / f"{cpp_id(op['weight'])}.bin")
+            weight = initializers[op["weight"]]
+            if op.get("weight_transposed"):
+                # MatMul+Add's W is stored [in,out] (exp26) — linear()
+                # (common.hpp) expects [out,in], same as Gemm(transB=1)
+                # already provides; .T is a view, but tofile() always
+                # writes in C order of the (transposed) shape, so this
+                # lands correctly without an explicit copy.
+                weight = weight.T
+            weight.astype(np.float32).tofile(out_dir / f"{cpp_id(op['weight'])}.bin")
             initializers[op["bias"]].astype(np.float32).tofile(out_dir / f"{cpp_id(op['bias'])}.bin")
 
     if (source_artifacts_dir / "test_config.txt").exists():
