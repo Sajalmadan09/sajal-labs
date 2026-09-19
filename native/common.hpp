@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,18 @@ inline std::vector<float> load_f32(const std::string& path, size_t count) {
     if (!f) throw std::runtime_error("cannot open " + path);
     std::vector<float> data(count);
     f.read(reinterpret_cast<char*>(data.data()), count * sizeof(float));
+    if (!f) throw std::runtime_error("short read: " + path);
+    return data;
+}
+
+// exp32: token ids (Gather indices) are int64, matching ONNX's own
+// convention for embedding-lookup indices (and PyTorch's default
+// torch.long dtype for them).
+inline std::vector<int64_t> load_i64(const std::string& path, size_t count) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    std::vector<int64_t> data(count);
+    f.read(reinterpret_cast<char*>(data.data()), count * sizeof(int64_t));
     if (!f) throw std::runtime_error("short read: " + path);
     return data;
 }
@@ -101,6 +114,25 @@ inline void add_inplace(float* dst, const float* src, size_t n) {
 inline void causal_mask_rows(float* scores, int n) {
     for (int i = 0; i < n; ++i)
         for (int j = i + 1; j < n; ++j) scores[static_cast<size_t>(i) * n + j] = -INFINITY;
+}
+
+// exp32: token embedding lookup — row indices[i] of table (vocab_size x
+// dim, row-major) copied into row i of out. The ONE piece of a real
+// model's forward pass that can never be precomputed: the actual token
+// ids vary every call.
+inline void gather_embedding_rows(const int64_t* indices, int n, const float* table, int dim, float* out) {
+    for (int i = 0; i < n; ++i) {
+        const float* row = table + static_cast<size_t>(indices[i]) * dim;
+        std::copy(row, row + dim, out + static_cast<size_t>(i) * dim);
+    }
+}
+
+// exp32: position embedding lookup with indices always 0..n-1 — this
+// compiler already knows n at runtime (it's forward()'s own parameter),
+// so there's nothing to compute: just the position table's own first n
+// rows, copied as-is.
+inline void position_embedding_rows(const float* table, int n, int dim, float* out) {
+    std::copy(table, table + static_cast<size_t>(n) * dim, out);
 }
 
 // Multi-head self-attention computed WITHOUT calling into cblas_sgemm.

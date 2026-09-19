@@ -1,4 +1,4 @@
-"""exp15-30: the smallest real ONNX -> native C++ compiler.
+"""exp15-32: the smallest real ONNX -> native C++ compiler.
 exp15: Gemm->Relu->Gemm->Softmax, a fixed 4-op template, flat sequential IR.
 exp16: generalized to 5 ops (added LayerNorm/GELU), still flat/sequential.
 exp17: the IR became a real DAG (named tensors, not "previous op's output"),
@@ -131,6 +131,21 @@ assumed exactly one), and the mask's dynamic-shape bookkeeping subgraph
 (Shape/Slice/Concat feeding Expand) needed explicit marking as consumed
 dead weight rather than being left for the main walk to reject. Real
 GPT-2, traced directly with zero rewiring, now compiles.
+
+exp32: token + position embeddings via Gather — the first time the
+compiled model's own external input type changes (int64 token ids
+instead of float features) for graphs that start with an embedding
+lookup. try_match_token_embedding recognizes Gather(table, input_ids)
+directly; try_match_position_embedding_chain recognizes PyTorch's real
+`wpe(torch.arange(seq))` export (Shape->Gather(0)->Cast->Range->Gather) —
+present only when the export uses a dynamic sequence-length axis, since a
+FIXED axis gets the whole thing constant-folded into a per-position bias
+instead (found by exporting both ways and reading what each produced).
+Combining a dynamically-shaped embedding layer with the (fixed-shape)
+12-layer stack in one graph explodes to 2400+ nodes, since dynamic
+seq_len propagates into every block's own reshapes — out of scope here;
+validated instead as two independently compiled artifacts chained
+together, matching real GPT-2's true end-to-end output.
 
 Everything else (op-to-function mapping, DAG-based tensor tracking, weight
 extraction convention) is unchanged from exp17 — see its docstring.
@@ -350,6 +365,93 @@ def try_match_identity_reshape(node, constants, tensor_dims):
     if in_tensor not in tensor_dims or tensor_dims[in_tensor] != d:
         return None
     return {"op": "identity", "output": node.output[0], "input": in_tensor, "dim": d}
+
+
+def try_match_token_embedding(node, graph_input_name, initializer_names, initializers):
+    """Recognizes `Gather(embedding_table, input_ids)` where input_ids IS
+    the graph's own declared input (exp32) — token embedding lookup, the
+    one piece of a real model's forward pass that can never be
+    constant-folded (the actual token ids vary every call, unlike
+    position ids for a fixed-length export — see
+    try_match_position_embedding_chain's docstring). Returns an ir_entry
+    or None."""
+    if node.op_type != "Gather" or len(node.input) != 2:
+        return None
+    table_name, indices_name = node.input
+    if indices_name != graph_input_name or table_name not in initializer_names:
+        return None
+    table = initializers.get(table_name)
+    if table is None or table.ndim != 2:
+        return None
+    vocab_size, dim = table.shape
+    return {"op": "embedding", "output": node.output[0],
+            "table": table_name, "vocab_size": int(vocab_size), "dim": int(dim)}
+
+
+def try_match_position_embedding_chain(nodes, shape_idx, constants, initializer_names, initializers):
+    """Looks for `Shape(x) -> Gather(shape_out, 0) -> Cast -> Range(0, len,
+    1) -> Gather(position_table, range_out)` — PyTorch's export of
+    `self.wpe(torch.arange(x.shape[0]))` (exp32), but ONLY when traced
+    with a dynamic sequence-length axis. Exported at a fixed length
+    instead, the whole thing constant-folds away into a precomputed
+    per-position bias (found by exporting both ways and reading what each
+    produced — not assumed). This whole chain computes a value this
+    compiler already knows at runtime (n, the row count passed to
+    forward()), so none of it needs translating — it's marked consumed
+    (dead weight) rather than emitted, and the final Gather becomes a
+    plain 'first n rows of the position table' copy, no indices needed.
+    Returns (ir_entry, consumed_indices) or None — starting position,
+    triggered on Shape the same way exp29's Split lookahead and exp30's
+    dead shape-bookkeeping chain were: the dependency (this whole chain)
+    sits BEFORE the node whose match actually claims it."""
+    shape_node = nodes[shape_idx]
+    if shape_node.op_type != "Shape" or len(shape_node.input) != 1:
+        return None
+
+    def find_consumers(tensor_name, op_type):
+        return [(idx, n) for idx, n in enumerate(nodes) if tensor_name in n.input and n.op_type == op_type]
+
+    gather0_matches = find_consumers(shape_node.output[0], "Gather")
+    if len(gather0_matches) != 1:
+        return None
+    gather0_idx, gather0_node = gather0_matches[0]
+    if len(gather0_node.input) != 2 or _constant_value(gather0_node.input[1], constants) != 0.0:
+        return None
+
+    cast_matches = find_consumers(gather0_node.output[0], "Cast")
+    if len(cast_matches) != 1:
+        return None
+    cast_idx, cast_node = cast_matches[0]
+
+    range_matches = find_consumers(cast_node.output[0], "Range")
+    if len(range_matches) != 1:
+        return None
+    range_idx, range_node = range_matches[0]
+    if len(range_node.input) != 3 or range_node.input[1] != cast_node.output[0]:
+        return None
+    start_val = _constant_value(range_node.input[0], constants)
+    delta_val = _constant_value(range_node.input[2], constants)
+    if start_val != 0.0 or delta_val != 1.0:
+        return None
+
+    final_matches = find_consumers(range_node.output[0], "Gather")
+    if len(final_matches) != 1:
+        return None
+    final_idx, final_node = final_matches[0]
+    if len(final_node.input) != 2:
+        return None
+    table_name = final_node.input[0]
+    if table_name not in initializer_names:
+        return None
+    table = initializers.get(table_name)
+    if table is None or table.ndim != 2:
+        return None
+    vocab_size, dim = table.shape
+
+    consumed = {shape_idx, gather0_idx, cast_idx, range_idx, final_idx}
+    ir_entry = {"op": "embedding_position", "output": final_node.output[0],
+                "table": table_name, "vocab_size": int(vocab_size), "dim": int(dim)}
+    return ir_entry, consumed
 
 
 def try_match_matmul_add_linear(nodes, i, initializer_names, initializers):
@@ -1157,6 +1259,29 @@ def parse_onnx(onnx_path):
             i += 1
             continue
 
+        token_emb_match = try_match_token_embedding(node, graph_input_name, initializer_names, initializers)
+        if token_emb_match is not None:
+            tensor_dims[token_emb_match["output"]] = token_emb_match["dim"]
+            ir.append(token_emb_match)
+            i += 1
+            continue
+
+        if node.op_type == "Shape":
+            # exp32: the dead-end Shape/Gather(idx0)/Cast/Range chain that
+            # recomputes n at runtime (see
+            # try_match_position_embedding_chain's docstring) sits BEFORE
+            # the position-embedding Gather that actually depends on it —
+            # same ordering problem exp29's Split lookahead solved, so the
+            # same lookahead shape is used here.
+            pos_match = try_match_position_embedding_chain(nodes, i, constants, initializer_names, initializers)
+            if pos_match is not None:
+                ir_entry, consumed = pos_match
+                emit_at = max(consumed)
+                consumed_skip |= consumed - {emit_at}
+                pending_emit[emit_at] = ir_entry
+                i += 1
+                continue
+
         if node.op_type == "Split":
             # exp29: GPT-2's real combined c_attn projection puts Split
             # BEFORE the Reshape that actually triggers
@@ -1194,7 +1319,8 @@ def parse_onnx(onnx_path):
             raise UnsupportedGraph(
                 f"op '{node.op_type}' is not supported by this compiler outside the recognized "
                 f"self-attention / multi-head-attention / decomposed-GELU / tanh-GELU / "
-                f"MatMul+Add-linear / batch-squeeze-reshape patterns "
+                f"MatMul+Add-linear / batch-squeeze-reshape / token-embedding / "
+                f"position-embedding patterns "
                 f"(supported standalone: {sorted(SUPPORTED_OPS)})"
             )
         if len(node.output) != 1:
@@ -1299,18 +1425,36 @@ def generate_cpp(ir, graph_input_name):
     """One block of C++ per IR op, reading/writing named variables that
     correspond directly to ONNX tensor names."""
 
+    # exp32: an embedding-starting model's external input is token ids
+    # (integers), not floats — the first structural change to what this
+    # compiler's own forward() signature can look like since exp15.
+    has_embedding = any(op["op"] in ("embedding", "embedding_position") for op in ir)
+
     def var(tensor_name):
-        return "X" if tensor_name == graph_input_name else cpp_id(tensor_name)
+        if tensor_name == graph_input_name:
+            return "input_ids" if has_embedding else "X"
+        return cpp_id(tensor_name)
 
     # exp28: a pre-norm model (LayerNorm before the sub-block, not after —
     # GPT-2's convention) can start with `layernorm` rather than `linear`;
     # every dim-preserving op ("dim") or Linear ("in_dim") knows its own
-    # input width either way.
-    input_dim = ir[0].get("in_dim", ir[0].get("dim"))
-    # Last Linear's out_dim — correct for every model tested so far (all end in a
-    # projection). A model ending directly in attention/LayerNorm with no trailing
-    # Linear would need this generalized; not attempted since no test case needs it yet.
-    output_dim = next(op["out_dim"] for op in reversed(ir) if op["op"] == "linear")
+    # input width either way. exp32: an embedding-starting model's "input
+    # width" isn't a float feature count at all (each row is one integer
+    # token id) — INPUT_DIM is only ever used to size a FLOAT dummy input
+    # for bench/once modes, which embedding models don't do (see
+    # dummy_input_decl below), so its exact value here is moot; 1 is the
+    # honest answer (one int64 per row) rather than the embedding
+    # dimension ir[0]["dim"] would otherwise resolve to.
+    input_dim = 1 if has_embedding else ir[0].get("in_dim", ir[0].get("dim"))
+    # Last Linear's out_dim — correct for every model with a trailing
+    # projection (most of them). exp32: a graph that never has a Linear
+    # at all (an embedding layer alone, token+position lookup then Add,
+    # no projection) falls back to the final op's own dim/out_dim instead
+    # — found by trying exactly that case and reading the resulting
+    # StopIteration, not anticipated.
+    output_dim = next((op["out_dim"] for op in reversed(ir) if op["op"] == "linear"), None)
+    if output_dim is None:
+        output_dim = ir[-1].get("out_dim", ir[-1].get("dim"))
     final_output_var = var(ir[-1]["output"])
 
     member_decls, load_lines, forward_lines = [], [], []
@@ -1330,6 +1474,22 @@ def generate_cpp(ir, graph_input_name):
             # compute, just a name for the same [n, dim] data.
             in_var = var(op["input"])
             forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
+        elif op["op"] == "embedding":
+            table = cpp_id(op["table"])
+            member_decls.append(f"    std::vector<float> {table};")
+            load_lines.append(
+                f'    m.{table} = load_f32(dir + "/{table}.bin", static_cast<size_t>({op["vocab_size"]}) * {op["dim"]});')
+            forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {op['dim']});")
+            forward_lines.append(
+                f"        gather_embedding_rows(input_ids.data(), n, {table}.data(), {op['dim']}, {out_var}.data());")
+        elif op["op"] == "embedding_position":
+            table = cpp_id(op["table"])
+            member_decls.append(f"    std::vector<float> {table};")
+            load_lines.append(
+                f'    m.{table} = load_f32(dir + "/{table}.bin", static_cast<size_t>({op["vocab_size"]}) * {op["dim"]});')
+            forward_lines.append(f"        std::vector<float> {out_var}(static_cast<size_t>(n) * {op['dim']});")
+            forward_lines.append(
+                f"        position_embedding_rows({table}.data(), n, {op['dim']}, {out_var}.data());")
         elif op["op"] in ("relu", "gelu", "gelu_tanh", "softmax"):
             in_var = var(op["input"])
             forward_lines.append(f"        std::vector<float> {out_var} = {in_var};")
@@ -1413,11 +1573,25 @@ def generate_cpp(ir, graph_input_name):
     # at runtime same as run_mode already does. Non-attention models keep
     # n=1 (one independent example), matching mlp.cpp/gender_predict.cpp's
     # own bench/once convention exactly, unchanged from exp15.
+    # exp32: an embedding-starting model is inherently sequence-shaped
+    # (each row of input_ids is one token of one sequence) the same way
+    # an attention-containing model already is — "one inference" means
+    # the full sequence length, not n independent rows, whether or not
+    # attention is ALSO present in the same graph.
     has_attention = any(op["op"] in ("self_attention", "multihead_self_attention") for op in ir)
-    if has_attention:
+    if has_attention or has_embedding:
         read_n = '    std::ifstream cfg(dir + "/test_config.txt");\n    int in_dim, n;\n    cfg >> in_dim >> n;'
     else:
         read_n = "    int n = 1;"
+
+    if has_embedding:
+        forward_param = "const std::vector<int64_t>& input_ids"
+        run_mode_load = 'auto X = load_i64(dir + "/test_inputs.bin", static_cast<size_t>(n_test));'
+        dummy_input_decl = "std::vector<int64_t> x(static_cast<size_t>(n), 0);"
+    else:
+        forward_param = "const std::vector<float>& X"
+        run_mode_load = 'auto X = load_f32(dir + "/test_inputs.bin", static_cast<size_t>(n_test) * in_dim);'
+        dummy_input_decl = "std::vector<float> x(static_cast<size_t>(n) * CompiledModel::INPUT_DIM, 0.1f);"
 
     return f"""\
 // AUTO-GENERATED by python/sajal_compile.py — do not hand-edit.
@@ -1434,7 +1608,7 @@ struct CompiledModel {{
     static constexpr int INPUT_DIM = {input_dim}, OUTPUT_DIM = {output_dim};
 {chr(10).join(member_decls)}
 
-    std::vector<float> forward(const std::vector<float>& X, int n) const {{
+    std::vector<float> forward({forward_param}, int n) const {{
 {body}
         return {final_output_var};
     }}
@@ -1451,7 +1625,7 @@ void run_mode(const std::string& dir) {{
     std::ifstream cfg(dir + "/test_config.txt");
     int in_dim, n_test;
     cfg >> in_dim >> n_test;
-    auto X = load_f32(dir + "/test_inputs.bin", static_cast<size_t>(n_test) * in_dim);
+    {run_mode_load}
     auto Y = m.forward(X, n_test);
     std::ofstream out(dir + "/native_outputs.bin", std::ios::binary);
     out.write(reinterpret_cast<char*>(Y.data()), Y.size() * sizeof(float));
@@ -1467,7 +1641,7 @@ void bench_mode(const std::string& dir) {{
     auto cold_start_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
 
 {read_n}
-    std::vector<float> x(static_cast<size_t>(n) * CompiledModel::INPUT_DIM, 0.1f);
+    {dummy_input_decl}
 
     const int WARMUP = 50, ITERS = 500;
     for (int i = 0; i < WARMUP; ++i) m.forward(x, n);
@@ -1495,7 +1669,7 @@ void bench_mode(const std::string& dir) {{
 void once_mode(const std::string& dir) {{
     CompiledModel m = load_model(dir);
 {read_n}
-    std::vector<float> x(static_cast<size_t>(n) * CompiledModel::INPUT_DIM, 0.1f);
+    {dummy_input_decl}
     auto y = m.forward(x, n);
     asm volatile("" : : "g"(y.data()) : "memory");
 }}
@@ -1538,6 +1712,8 @@ def compile_model(onnx_path, source_artifacts_dir, out_dir):
                 weight = weight.T
             weight.astype(np.float32).tofile(out_dir / f"{cpp_id(op['weight'])}.bin")
             initializers[op["bias"]].astype(np.float32).tofile(out_dir / f"{cpp_id(op['bias'])}.bin")
+        elif op["op"] in ("embedding", "embedding_position"):
+            initializers[op["table"]].astype(np.float32).tofile(out_dir / f"{cpp_id(op['table'])}.bin")
 
     if (source_artifacts_dir / "test_config.txt").exists():
         shutil.copy(source_artifacts_dir / "test_config.txt", out_dir / "test_config.txt")
